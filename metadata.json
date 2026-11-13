@@ -1,0 +1,6 @@
+{
+  "name": "TUG777 HyperTrade",
+  "description": "Terminal profesional de trading automatizado en Hyperliquid Perps con Cerebro Unificado IA, escudo anti-MEV/Flashbots, multi-conexión de baja latencia y aprendizaje continuo en Firestore.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

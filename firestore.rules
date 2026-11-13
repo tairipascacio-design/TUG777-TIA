@@ -1,0 +1,233 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'displayName', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 254
+        && (!('displayName' in data) || (data.displayName is string && data.displayName.size() <= 120))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidBotConfig(data, userId) {
+      return data.keys().hasAll([
+          'ownerId', 'mode', 'aiEnabled', 'network', 'masterWalletAddress',
+          'mevShieldEnabled', 'maxSlippageBps', 'maxOracleDeviationBps',
+          'riskPerTradeUsd', 'soundEnabled', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'mode', 'aiEnabled', 'network', 'masterWalletAddress',
+          'mevShieldEnabled', 'maxSlippageBps', 'maxOracleDeviationBps',
+          'riskPerTradeUsd', 'soundEnabled', 'aiProvider', 'customAiUrl',
+          'customAiModel', 'customSystemPrompt', 'scanIntervalSec',
+          'minConfidence', 'minQuantScore', 'minVolumeM', 'tpPct', 'slPct',
+          'useDeepThinking', 'useSearchGrounding', 'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
+        && data.mode in ['strategy', 'ai', 'strategy_ai']
+        && data.aiEnabled is bool
+        && data.network in ['mainnet', 'testnet']
+        && data.masterWalletAddress is string && data.masterWalletAddress.size() <= 64
+        && data.mevShieldEnabled is bool
+        && data.maxSlippageBps is number && data.maxSlippageBps >= 1 && data.maxSlippageBps <= 500
+        && data.maxOracleDeviationBps is number && data.maxOracleDeviationBps >= 1 && data.maxOracleDeviationBps <= 500
+        && data.riskPerTradeUsd is number && data.riskPerTradeUsd >= 1 && data.riskPerTradeUsd <= 1000000
+        && data.soundEnabled is bool
+        && (!('aiProvider' in data) || data.aiProvider in ['gemini', 'custom_ai'])
+        && (!('customAiUrl' in data) || (data.customAiUrl is string && data.customAiUrl.size() <= 256))
+        && (!('customAiModel' in data) || (data.customAiModel is string && data.customAiModel.size() <= 120))
+        && (!('customSystemPrompt' in data) || (data.customSystemPrompt is string && data.customSystemPrompt.size() <= 1500))
+        && (!('scanIntervalSec' in data) || (data.scanIntervalSec is number && data.scanIntervalSec >= 30 && data.scanIntervalSec <= 3600))
+        && (!('minConfidence' in data) || (data.minConfidence is number && data.minConfidence >= 40 && data.minConfidence <= 99))
+        && (!('minQuantScore' in data) || (data.minQuantScore is number && data.minQuantScore >= 20 && data.minQuantScore <= 95))
+        && (!('minVolumeM' in data) || (data.minVolumeM is number && data.minVolumeM >= 0.1 && data.minVolumeM <= 500))
+        && (!('tpPct' in data) || (data.tpPct is number && data.tpPct >= 0.2 && data.tpPct <= 100))
+        && (!('slPct' in data) || (data.slPct is number && data.slPct >= 0.2 && data.slPct <= 50))
+        && (!('useDeepThinking' in data) || data.useDeepThinking is bool)
+        && (!('useSearchGrounding' in data) || data.useSearchGrounding is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPosition(data, userId) {
+      return data.keys().hasAll([
+          'ownerId', 'coin', 'side', 'size', 'entryPx', 'markPx', 'leverage',
+          'unrealizedPnl', 'realizedPnl', 'status', 'mode', 'hlOrderId', 'thesis',
+          'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId', 'coin', 'side', 'size', 'entryPx', 'markPx', 'leverage',
+          'unrealizedPnl', 'realizedPnl', 'status', 'mode', 'hlOrderId', 'thesis',
+          'createdAt', 'updatedAt'
+        ])
+        && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
+        && data.coin is string && data.coin.size() >= 1 && data.coin.size() <= 32
+        && data.side in ['LONG', 'SHORT']
+        && data.size is number && data.size >= 0
+        && data.entryPx is number && data.entryPx >= 0
+        && data.markPx is number && data.markPx >= 0
+        && data.leverage is number && data.leverage >= 1 && data.leverage <= 100
+        && data.unrealizedPnl is number
+        && data.realizedPnl is number
+        && data.status in ['OPEN', 'CLOSED']
+        && data.mode in ['strategy', 'ai', 'strategy_ai', 'manual']
+        && data.hlOrderId is string && data.hlOrderId.size() <= 128
+        && data.thesis is string && data.thesis.size() <= 600
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidTradeLog(data, userId) {
+      return data.keys().hasAll(['ownerId', 'level', 'category', 'coin', 'message', 'latencyMs', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'level', 'category', 'coin', 'message', 'latencyMs', 'createdAt'])
+        && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
+        && data.level in ['INFO', 'EXEC', 'MEV_GUARD', 'WARN', 'ERROR']
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 48
+        && data.coin is string && data.coin.size() >= 1 && data.coin.size() <= 32
+        && data.message is string && data.message.size() >= 1 && data.message.size() <= 800
+        && data.latencyMs is number && data.latencyMs >= 0
+        && data.createdAt is timestamp;
+    }
+
+    function isValidAiMemory(data, userId) {
+      return data.keys().hasAll(['ownerId', 'coin', 'regime', 'outcome', 'pnlUsd', 'lesson', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'coin', 'regime', 'outcome', 'pnlUsd', 'lesson', 'createdAt'])
+        && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
+        && data.coin is string && data.coin.size() >= 1 && data.coin.size() <= 32
+        && data.regime is string && data.regime.size() >= 1 && data.regime.size() <= 64
+        && data.outcome in ['WIN', 'LOSS', 'BREAKEVEN']
+        && data.pnlUsd is number
+        && data.lesson is string && data.lesson.size() >= 1 && data.lesson.size() <= 800
+        && data.createdAt is timestamp;
+    }
+
+    function isValidChatMessage(data, userId) {
+      return data.keys().hasAll(['ownerId', 'role', 'content', 'modelUsed', 'createdAt'])
+        && data.keys().hasOnly(['ownerId', 'role', 'content', 'modelUsed', 'createdAt'])
+        && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
+        && data.role in ['user', 'assistant']
+        && data.content is string && data.content.size() >= 1 && data.content.size() <= 8000
+        && data.modelUsed is string && data.modelUsed.size() >= 1 && data.modelUsed.size() <= 64
+        && data.createdAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isOwner(userId);
+      allow create: if isValidId(userId) && isVerifiedUser() && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId) && isVerifiedUser() && isOwner(userId)
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'updatedAt']);
+
+      match /bot_configs/{configId} {
+        allow get: if isValidId(userId) && isValidId(configId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(configId) && isVerifiedUser() && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidBotConfig(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId) && isValidId(configId) && isVerifiedUser() && isOwner(userId)
+          && isValidBotConfig(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'mode', 'aiEnabled', 'network', 'masterWalletAddress',
+            'mevShieldEnabled', 'maxSlippageBps', 'maxOracleDeviationBps',
+            'riskPerTradeUsd', 'soundEnabled', 'aiProvider', 'customAiUrl',
+            'customAiModel', 'customSystemPrompt', 'scanIntervalSec',
+            'minConfidence', 'minQuantScore', 'minVolumeM', 'tpPct', 'slPct',
+            'useDeepThinking', 'useSearchGrounding', 'updatedAt'
+          ]);
+      }
+
+      match /positions/{positionId} {
+        allow get: if isValidId(userId) && isValidId(positionId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(positionId) && isVerifiedUser() && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidPosition(incoming(), userId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId) && isValidId(positionId) && isVerifiedUser() && isOwner(userId)
+          && existing().status == 'OPEN'
+          && isValidPosition(incoming(), userId)
+          && incoming().ownerId == existing().ownerId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && (
+            (incoming().status == 'OPEN' && incoming().diff(existing()).affectedKeys().hasOnly(['markPx', 'unrealizedPnl', 'size', 'updatedAt'])) ||
+            (incoming().status == 'CLOSED' && incoming().diff(existing()).affectedKeys().hasOnly(['markPx', 'unrealizedPnl', 'realizedPnl', 'status', 'updatedAt']))
+          );
+        allow delete: if isValidId(userId) && isValidId(positionId) && isVerifiedUser() && isOwner(userId);
+      }
+
+      match /trade_logs/{logId} {
+        allow get: if isValidId(userId) && isValidId(logId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(logId) && isVerifiedUser() && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidTradeLog(incoming(), userId)
+          && incoming().createdAt == request.time;
+        allow delete: if isValidId(userId) && isValidId(logId) && isVerifiedUser() && isOwner(userId);
+      }
+
+      match /ai_memory/{memoryId} {
+        allow get: if isValidId(userId) && isValidId(memoryId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(memoryId) && isVerifiedUser() && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidAiMemory(incoming(), userId)
+          && incoming().createdAt == request.time;
+        allow delete: if isValidId(userId) && isValidId(memoryId) && isVerifiedUser() && isOwner(userId);
+      }
+
+      match /chat_messages/{messageId} {
+        allow get: if isValidId(userId) && isValidId(messageId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(messageId) && isVerifiedUser() && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidChatMessage(incoming(), userId)
+          && incoming().createdAt == request.time;
+        allow delete: if isValidId(userId) && isValidId(messageId) && isVerifiedUser() && isOwner(userId);
+      }
+    }
+  }
+}

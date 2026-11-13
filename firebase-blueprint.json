@@ -1,0 +1,351 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated trader profile anchored to Firebase Auth UID.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "maxLength": 254
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "email", "createdAt", "updatedAt"]
+    },
+    "BotConfig": {
+      "title": "BotConfig",
+      "description": "Persistent configuration for the unified Hyperliquid AI & Strategy Brain.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["strategy", "ai", "strategy_ai"]
+        },
+        "aiEnabled": {
+          "type": "boolean"
+        },
+        "network": {
+          "type": "string",
+          "enum": ["mainnet", "testnet"]
+        },
+        "masterWalletAddress": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "mevShieldEnabled": {
+          "type": "boolean"
+        },
+        "maxSlippageBps": {
+          "type": "number"
+        },
+        "maxOracleDeviationBps": {
+          "type": "number"
+        },
+        "riskPerTradeUsd": {
+          "type": "number"
+        },
+        "soundEnabled": {
+          "type": "boolean"
+        },
+        "aiProvider": {
+          "type": "string",
+          "enum": ["gemini", "custom_ai"]
+        },
+        "customAiUrl": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "customAiModel": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "customSystemPrompt": {
+          "type": "string",
+          "maxLength": 1500
+        },
+        "scanIntervalSec": {
+          "type": "number"
+        },
+        "minConfidence": {
+          "type": "number"
+        },
+        "minQuantScore": {
+          "type": "number"
+        },
+        "minVolumeM": {
+          "type": "number"
+        },
+        "tpPct": {
+          "type": "number"
+        },
+        "slPct": {
+          "type": "number"
+        },
+        "useDeepThinking": {
+          "type": "boolean"
+        },
+        "useSearchGrounding": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "mode",
+        "aiEnabled",
+        "network",
+        "masterWalletAddress",
+        "mevShieldEnabled",
+        "maxSlippageBps",
+        "maxOracleDeviationBps",
+        "riskPerTradeUsd",
+        "soundEnabled",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PositionRecord": {
+      "title": "PositionRecord",
+      "description": "Persisted live Hyperliquid perpetual position state surviving page reloads.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "coin": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "side": {
+          "type": "string",
+          "enum": ["LONG", "SHORT"]
+        },
+        "size": {
+          "type": "number"
+        },
+        "entryPx": {
+          "type": "number"
+        },
+        "markPx": {
+          "type": "number"
+        },
+        "leverage": {
+          "type": "number"
+        },
+        "unrealizedPnl": {
+          "type": "number"
+        },
+        "realizedPnl": {
+          "type": "number"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["OPEN", "CLOSED"]
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["strategy", "ai", "strategy_ai", "manual"]
+        },
+        "hlOrderId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "thesis": {
+          "type": "string",
+          "maxLength": 600
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "coin",
+        "side",
+        "size",
+        "entryPx",
+        "markPx",
+        "leverage",
+        "unrealizedPnl",
+        "realizedPnl",
+        "status",
+        "mode",
+        "hlOrderId",
+        "thesis",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TradeLog": {
+      "title": "TradeLog",
+      "description": "Immutable execution, Flashbots/MEV shield, and latency audit log entry.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "level": {
+          "type": "string",
+          "enum": ["INFO", "EXEC", "MEV_GUARD", "WARN", "ERROR"]
+        },
+        "category": {
+          "type": "string",
+          "maxLength": 48
+        },
+        "coin": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 800
+        },
+        "latencyMs": {
+          "type": "number"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "level", "category", "coin", "message", "latencyMs", "createdAt"]
+    },
+    "AiMemory": {
+      "title": "AiMemory",
+      "description": "Post-trade learning insight extracted from real market execution.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "coin": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "regime": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "outcome": {
+          "type": "string",
+          "enum": ["WIN", "LOSS", "BREAKEVEN"]
+        },
+        "pnlUsd": {
+          "type": "number"
+        },
+        "lesson": {
+          "type": "string",
+          "maxLength": 800
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "coin", "regime", "outcome", "pnlUsd", "lesson", "createdAt"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "Multi-turn conversation history with the Unified Trading AI Brain.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "assistant"]
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 8000
+        },
+        "modelUsed": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["ownerId", "role", "content", "modelUsed", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Private user profile root document."
+    },
+    "/users/{userId}/bot_configs/{configId}": {
+      "schema": { "$ref": "#/entities/BotConfig" },
+      "description": "Persistent strategy, AI, and MEV shield configuration."
+    },
+    "/users/{userId}/positions/{positionId}": {
+      "schema": { "$ref": "#/entities/PositionRecord" },
+      "description": "Tracked Hyperliquid live positions across reloads."
+    },
+    "/users/{userId}/trade_logs/{logId}": {
+      "schema": { "$ref": "#/entities/TradeLog" },
+      "description": "Execution, MEV shield, and latency audit logs."
+    },
+    "/users/{userId}/ai_memory/{memoryId}": {
+      "schema": { "$ref": "#/entities/AiMemory" },
+      "description": "Real trade outcomes and learned heuristics for AI feedback loop."
+    },
+    "/users/{userId}/chat_messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChatMessage" },
+      "description": "Persistent AI Trading Copilot chat thread."
+    }
+  }
+}

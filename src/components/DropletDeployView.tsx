@@ -93,11 +93,11 @@ sudo certbot --nginx -d tu-subdominio.com`;
           <div className="flex items-center gap-2 text-amber-400">
             <Smartphone className="w-5 h-5" />
             <h2 className="text-base font-bold text-slate-100">
-              App Android (Instalación Directa + Kit APK Capacitor/TWA)
+              App Android (.apk Firmado + Instalación Directa)
             </h2>
           </div>
           <p className="text-xs text-slate-400 max-w-2xl">
-            Descarga el kit oficial listo para compilar el archivo `.apk` con Gradle/Android Studio apuntando a tu servidor, o instálala al instante en tu teléfono Android como app nativa standalone.
+            Descarga e instala directamente el archivo <code className="text-amber-300">TUG777-HyperTrade.apk</code> firmado para Android 7–15 (con soporte de audio, voz manos libres y selector de servidor para tu Droplet).
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2.5 shrink-0">
@@ -109,7 +109,7 @@ sudo certbot --nginx -d tu-subdominio.com`;
               }}
               className="px-4 py-2 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold whitespace-nowrap"
             >
-              Instalar App Ahora
+              Instalar App PWA
             </button>
           )}
           <button
@@ -118,7 +118,7 @@ sudo certbot --nginx -d tu-subdominio.com`;
             className="px-4 py-2 rounded-md bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold inline-flex items-center gap-2 whitespace-nowrap"
           >
             <Download className="w-4 h-4" />
-            {downloadingApk ? 'Empaquetando Kit...' : 'Descargar APK Kit (.zip)'}
+            {downloadingApk ? 'Descargando APK...' : 'Descargar TUG777-HyperTrade.apk'}
           </button>
         </div>
       </div>

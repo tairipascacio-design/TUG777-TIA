@@ -20,6 +20,7 @@ import {
   Sliders,
   Volume2,
   VolumeX,
+  XCircle,
 } from 'lucide-react';
 import { AiBrainParamsModal } from './components/AiBrainParamsModal';
 import { AiCopilotDrawer } from './components/AiCopilotDrawer';
@@ -40,11 +41,15 @@ import {
   closePersistedPosition,
   createPersistedPosition,
   ensureUserProfileAndConfig,
+  recordStrategyTradeOutcome,
   saveBotConfig,
   subscribeAiMemories,
   subscribeChatMessages,
   subscribePositions,
+  subscribeStrategyPlaybook,
   subscribeTradeLogs,
+  syncStrategyPlaybook,
+  toggleStrategyPlaybookItem,
 } from './services/firestoreService';
 import {
   evaluateMevShield,
@@ -57,11 +62,18 @@ import {
   fetchUserFills,
   resolveMasterFromAgentKey,
 } from './services/hyperliquidClient';
+import {
+  POSITION_MANAGEMENT_GUIDE_RULES,
+  computeDynamicOrderNotionalUsd,
+  evaluateOpenPositionManagement,
+  evaluateUnifiedDeepSetup,
+} from './services/strategyEngine';
 import type {
   AiBrainDecision,
   AiMemoryEntry,
   BotConfigData,
   ChatMessageEntry,
+  DeepAssetAnalysis,
   HlAccountSummary,
   HlAssetMarket,
   HlCandle,
@@ -69,6 +81,7 @@ import type {
   HlUserFill,
   MevProbeStatus,
   PersistedPosition,
+  StrategyPlaybookItem,
   TradeLogEntry,
   TradingMode,
 } from './types/trading';
@@ -88,6 +101,11 @@ const INITIAL_CONFIG: BotConfigData = {
   maxSlippageBps: 25,
   maxOracleDeviationBps: 45,
   riskPerTradeUsd: 50,
+  sizingMode: 'equity_pct',
+  capitalPctPerTrade: 25,
+  maxOpenPositions: 3,
+  trailingStopEnabled: true,
+  autoManagePositions: true,
   soundEnabled: true,
   aiProvider: 'gemini',
   customAiUrl: '',
@@ -102,6 +120,15 @@ const INITIAL_CONFIG: BotConfigData = {
   useDeepThinking: false,
   useSearchGrounding: false,
 };
+
+async function parseAiJson<T>(res: Response): Promise<T> {
+  const text = await res.text();
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.startsWith('<')) {
+    throw new Error(`El servidor devolvió HTML en lugar de JSON (HTTP ${res.status}).`);
+  }
+  return JSON.parse(trimmed) as T;
+}
 
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
@@ -121,7 +148,11 @@ export default function App() {
   });
   const [apiPrivateKey, setApiPrivateKey] = useState<string>(() => {
     if (typeof window === 'undefined') return '';
-    return sessionStorage.getItem('tug777_hl_agent_pk') || '';
+    return (
+      sessionStorage.getItem('tug777_hl_agent_pk') ||
+      localStorage.getItem('tug777_hl_agent_pk_saved') ||
+      ''
+    );
   });
 
   const [activeTab, setActiveTab] = useState<ActiveTab>('terminal');
@@ -148,6 +179,7 @@ export default function App() {
   const [persistedPositions, setPersistedPositions] = useState<PersistedPosition[]>([]);
   const [tradeLogs, setTradeLogs] = useState<TradeLogEntry[]>([]);
   const [aiMemories, setAiMemories] = useState<AiMemoryEntry[]>([]);
+  const [strategyPlaybook, setStrategyPlaybook] = useState<StrategyPlaybookItem[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessageEntry[]>([]);
 
   // Brain & Execution State
@@ -155,12 +187,16 @@ export default function App() {
   const [biasFilter, setBiasFilter] = useState<'ALL' | 'LONG' | 'SHORT'>('ALL');
   const [executing, setExecuting] = useState(false);
   const [closingCoin, setClosingCoin] = useState<string | null>(null);
+  const [closingAll, setClosingAll] = useState(false);
   const [brainThinking, setBrainThinking] = useState(false);
+  const [learningHistory, setLearningHistory] = useState(false);
   const [lastDecision, setLastDecision] = useState<AiBrainDecision | null>(null);
   const [macroBrief, setMacroBrief] = useState<string>('');
   const [macroSources, setMacroSources] = useState<Array<{ uri: string; title: string }>>([]);
   const [statusNotice, setStatusNotice] = useState<{ type: 'info' | 'error' | 'ok'; text: string } | null>(null);
   const [chatSending, setChatSending] = useState(false);
+  const peakMoveByCoinRef = useRef<Record<string, number>>({});
+  const managingPositionsRef = useRef(false);
 
   // Voice Narrator (TTS) & Hands-Free Voice Commands (SpeechRecognition)
   const [voiceNarratorEnabled, setVoiceNarratorEnabled] = useState<boolean>(() => {
@@ -181,6 +217,54 @@ export default function App() {
   }, [markets]);
 
   const selectedAsset = marketsByCoin.get(selectedCoin);
+
+  const fillsSummary = useMemo(() => {
+    const closed = userFills.filter((f) => Math.abs(f.closedPnl) > 0.0001);
+    const totalFeesUsd = userFills.reduce((acc, f) => acc + f.fee, 0);
+    const coinMap = new Map<string, { coin: string; netPnl: number; trades: number; wins: number; losses: number }>();
+    let winsCount = 0;
+    let netPnlUsd = 0;
+
+    for (const f of closed) {
+      const net = f.closedPnl - f.fee;
+      netPnlUsd += net;
+      if (net > 0) winsCount += 1;
+      const cur = coinMap.get(f.coin) || { coin: f.coin, netPnl: 0, trades: 0, wins: 0, losses: 0 };
+      cur.netPnl += net;
+      cur.trades += 1;
+      if (net > 0) cur.wins += 1;
+      else cur.losses += 1;
+      coinMap.set(f.coin, cur);
+    }
+
+    const coinStats = Array.from(coinMap.values());
+    const losingCoins = [...coinStats]
+      .filter((c) => c.netPnl < 0)
+      .sort((a, b) => a.netPnl - b.netPnl)
+      .slice(0, 5)
+      .map((c) => ({ ...c, netPnl: Number(c.netPnl.toFixed(2)) }));
+    const winningCoins = [...coinStats]
+      .filter((c) => c.netPnl > 0)
+      .sort((a, b) => b.netPnl - a.netPnl)
+      .slice(0, 5)
+      .map((c) => ({ ...c, netPnl: Number(c.netPnl.toFixed(2)) }));
+
+    return {
+      totalClosed: closed.length,
+      winRatePct: closed.length > 0 ? Number(((winsCount / closed.length) * 100).toFixed(1)) : 0,
+      netPnlUsd: Number(netPnlUsd.toFixed(2)),
+      totalFeesUsd: Number(totalFeesUsd.toFixed(2)),
+      losingCoins,
+      winningCoins,
+      recentClosed: closed.slice(0, 10).map((f) => ({
+        coin: f.coin,
+        side: f.side,
+        netPnl: Number((f.closedPnl - f.fee).toFixed(2)),
+        px: f.px,
+        time: f.time,
+      })),
+    };
+  }, [userFills]);
 
   // Sync audio & voice preferences + known Hyperliquid tickers
   useEffect(() => {
@@ -222,6 +306,7 @@ export default function App() {
         try {
           const loadedCfg = await ensureUserProfileAndConfig(firebaseUser);
           setConfig(loadedCfg);
+          await syncStrategyPlaybook(firebaseUser.uid);
         } catch (err) {
           console.error(err);
         }
@@ -236,6 +321,7 @@ export default function App() {
       setPersistedPositions([]);
       setTradeLogs([]);
       setAiMemories([]);
+      setStrategyPlaybook([]);
       setChatMessages([]);
       return;
     }
@@ -243,12 +329,14 @@ export default function App() {
     const unsubPos = subscribePositions(user.uid, setPersistedPositions);
     const unsubLogs = subscribeTradeLogs(user.uid, setTradeLogs);
     const unsubMem = subscribeAiMemories(user.uid, setAiMemories);
+    const unsubPlaybook = subscribeStrategyPlaybook(user.uid, setStrategyPlaybook);
     const unsubChat = subscribeChatMessages(user.uid, setChatMessages);
 
     return () => {
       unsubPos();
       unsubLogs();
       unsubMem();
+      unsubPlaybook();
       unsubChat();
     };
   }, [authReady, user]);
@@ -534,14 +622,15 @@ export default function App() {
       notionalUsd: number;
       mode: TradingMode | 'manual';
       thesis: string;
+      strategyTag?: string;
       reduceOnly?: boolean;
       overrideSizeCoins?: number;
-    }) => {
+    }): Promise<boolean> => {
       const asset = marketsByCoin.get(params.coin);
       if (!asset) {
         voiceEngine.speak(`Token ${params.coin} no encontrado en Hyperliquid.`, true);
         setStatusNotice({ type: 'error', text: `Token ${params.coin} no encontrado en Hyperliquid.` });
-        return;
+        return false;
       }
 
       if (!apiPrivateKey.trim()) {
@@ -552,37 +641,69 @@ export default function App() {
           text: 'Ingresa tu API Wallet Private Key para ejecutar órdenes reales en Hyperliquid.',
         });
         setApiModalOpen(true);
-        return;
+        return false;
       }
 
       setExecuting(true);
       voiceEngine.speak(
         params.reduceOnly
-          ? `Verificando escudo anti MEV para cerrar ${params.coin}.`
+          ? `Cerrando posición en ${params.coin}.`
           : `Verificando escudo anti MEV para ${params.side} en ${params.coin}.`
       );
       try {
-        // Fetch fresh L2 book right before order signing for strict Anti-MEV validation
-        const freshBook = await fetchL2Book(config.network, params.coin);
-        const mevCheck = evaluateMevShield({
-          enabled: config.mevShieldEnabled,
-          markPx: asset.markPx,
-          oraclePx: asset.oraclePx,
-          bids: freshBook.bids,
-          asks: freshBook.asks,
-          notionalUsd: params.notionalUsd,
-          maxSlippageBps: config.maxSlippageBps,
-          maxOracleDeviationBps: config.maxOracleDeviationBps,
-        });
-
-        await logEvent('MEV_GUARD', 'ANTI_MEV', params.coin, mevCheck.reason, freshBook.latencyMs);
-
-        if (!mevCheck.passed) {
-          soundEngine.alert();
-          voiceEngine.speak(`Orden bloqueada en ${params.coin} por escudo anti MEV. ${mevCheck.reason}`, true);
-          setStatusNotice({ type: 'error', text: `Orden bloqueada por Escudo MEV: ${mevCheck.reason}` });
-          return;
+        // Fetch fresh L2 book right before order signing (fail-safe for reduceOnly exits)
+        let freshBook: { bids: HlL2Level[]; asks: HlL2Level[]; latencyMs: number } | null = null;
+        try {
+          freshBook = await fetchL2Book(config.network, params.coin);
+        } catch {
+          freshBook = null;
         }
+
+        if (!params.reduceOnly) {
+          if (!freshBook) {
+            throw new Error(`No se pudo verificar libro L2 para abrir ${params.coin}.`);
+          }
+          const mevCheck = evaluateMevShield({
+            enabled: config.mevShieldEnabled,
+            markPx: asset.markPx,
+            oraclePx: asset.oraclePx,
+            bids: freshBook.bids,
+            asks: freshBook.asks,
+            notionalUsd: params.notionalUsd,
+            maxSlippageBps: config.maxSlippageBps,
+            maxOracleDeviationBps: config.maxOracleDeviationBps,
+          });
+
+          await logEvent('MEV_GUARD', 'ANTI_MEV', params.coin, mevCheck.reason, freshBook.latencyMs);
+
+          if (!mevCheck.passed) {
+            soundEngine.alert();
+            voiceEngine.speak(`Orden bloqueada en ${params.coin} por escudo anti MEV. ${mevCheck.reason}`, true);
+            setStatusNotice({ type: 'error', text: `Orden bloqueada por Escudo MEV: ${mevCheck.reason}` });
+            return false;
+          }
+        } else {
+          // Manual/Auto reduceOnly exits must NEVER be blocked by MEV spread/oracle gates
+          await logEvent(
+            'MEV_GUARD',
+            'CLOSE_BYPASS',
+            params.coin,
+            'Salida reduceOnly prioritaria (desbloqueada para cierre inmediato)',
+            freshBook?.latencyMs ?? 0
+          );
+        }
+
+        // For reduceOnly market closes, anchor to live top-of-book (bestAsk for BUY-to-close, bestBid for SELL-to-close)
+        // with a generous 500 bps (5%) worst-case IOC sweep cap so Hyperliquid matches resting liquidity instantly.
+        const freshBestPx =
+          params.reduceOnly && freshBook
+            ? params.side === 'LONG'
+              ? freshBook.asks[0]?.px || asset.markPx
+              : freshBook.bids[0]?.px || asset.markPx
+            : asset.markPx;
+        const effectiveSlippageBps = params.reduceOnly
+          ? Math.max(config.maxSlippageBps, 500)
+          : config.maxSlippageBps;
 
         const sizeCoins = params.overrideSizeCoins ?? params.notionalUsd / asset.markPx;
         const execResult = await executeRealHyperliquidOrder({
@@ -591,27 +712,43 @@ export default function App() {
           assetIndex: asset.index,
           szDecimals: asset.szDecimals,
           isBuy: params.side === 'LONG',
-          referencePx: asset.markPx,
+          referencePx: freshBestPx,
           sizeCoins,
-          slippageBps: config.maxSlippageBps,
+          slippageBps: effectiveSlippageBps,
           reduceOnly: params.reduceOnly,
         });
 
+        const respObj = execResult.exchangeResponse as {
+          status?: string;
+          response?: string | { data?: { statuses?: Array<{ error?: string }> } };
+        } | null;
+        const nestedStatuses =
+          typeof respObj?.response === 'object' && respObj?.response !== null
+            ? respObj.response.data?.statuses
+            : undefined;
+        const orderErr =
+          respObj?.status === 'err'
+            ? String(respObj.response || 'Rechazo Hyperliquid')
+            : Array.isArray(nestedStatuses)
+            ? nestedStatuses.find((s) => Boolean(s?.error))?.error
+            : undefined;
+
         const statusStr = JSON.stringify(execResult.exchangeResponse);
-        const hasHlError = statusStr.toLowerCase().includes('"error"');
+        const hasHlError = Boolean(orderErr) || statusStr.toLowerCase().includes('"error"');
+        const readableErr = orderErr || statusStr;
 
         if (hasHlError) {
           soundEngine.alert();
-          voiceEngine.speak(`Hyperliquid rechazó la orden en ${params.coin}.`, true);
+          voiceEngine.speak(`Hyperliquid rechazó la orden en ${params.coin}. ${orderErr || ''}`, true);
           await logEvent(
             'ERROR',
             'HL_EXCHANGE',
             params.coin,
-            `Rechazo Hyperliquid: ${statusStr}`,
+            `Rechazo Hyperliquid: ${readableErr}`,
             execResult.latencyMs
           );
-          setStatusNotice({ type: 'error', text: `Hyperliquid rechazó la orden: ${statusStr}` });
-          return;
+          setStatusNotice({ type: 'error', text: `Hyperliquid rechazó la orden: ${readableErr}` });
+          return false;
         }
 
         soundEngine.tradeExecuted();
@@ -648,6 +785,7 @@ export default function App() {
             mode: params.mode,
             hlOrderId: statusStr.slice(0, 120),
             thesis: params.thesis,
+            strategyTag: params.strategyTag || '',
           });
         }
 
@@ -656,12 +794,14 @@ export default function App() {
           text: `Orden real enviada (${params.coin} ${params.side}) en ${execResult.latencyMs} ms`,
         });
         await refreshAccountData();
+        return true;
       } catch (err) {
         soundEngine.alert();
         const msg = err instanceof Error ? err.message : String(err);
         voiceEngine.speak(`Error ejecutando orden en ${params.coin}: ${msg}`, true);
         await logEvent('ERROR', 'EXEC_FAIL', params.coin, msg);
         setStatusNotice({ type: 'error', text: msg });
+        return false;
       } finally {
         setExecuting(false);
       }
@@ -669,118 +809,340 @@ export default function App() {
     [marketsByCoin, apiPrivateKey, config, logEvent, user, refreshAccountData]
   );
 
-  // Unified Brain Cycle (Estrategia / IA / Estrategia + IA)
+  const handleCloseLivePosition = useCallback(
+    async (coin: string, side: 'LONG' | 'SHORT', size: number, customReason?: string) => {
+      setClosingCoin(coin);
+      try {
+        const closed = await submitProtectedOrder({
+          coin,
+          side: side === 'LONG' ? 'SHORT' : 'LONG',
+          notionalUsd: 0,
+          mode: 'manual',
+          thesis: customReason || 'Cierre reduceOnly en Hyperliquid',
+          reduceOnly: true,
+          overrideSizeCoins: size,
+        });
+
+        if (closed) {
+          delete peakMoveByCoinRef.current[coin];
+          const matchingOpen = persistedPositions.find((p) => p.coin === coin && p.status === 'OPEN');
+          const liveMark = marketsByCoin.get(coin)?.markPx ?? matchingOpen?.markPx ?? 0;
+
+          if (matchingOpen) {
+            const realized =
+              (matchingOpen.side === 'LONG'
+                ? liveMark - matchingOpen.entryPx
+                : matchingOpen.entryPx - liveMark) * matchingOpen.size;
+            if (user) {
+              await closePersistedPosition(user.uid, matchingOpen.id, liveMark, realized);
+              if (matchingOpen.strategyTag) {
+                await recordStrategyTradeOutcome(
+                  user.uid,
+                  matchingOpen.strategyTag.split(','),
+                  realized
+                );
+              }
+              await appendAiMemory(user.uid, {
+                coin,
+                regime: customReason ? 'Gestión Activa' : 'Cierre Real',
+                outcome: realized >= 0.05 ? 'WIN' : realized <= -0.05 ? 'LOSS' : 'BREAKEVEN',
+                pnlUsd: realized,
+                lesson: `${customReason || 'Cierre de posición real'} (${matchingOpen.side} ${coin} PnL ${realized >= 0 ? '+' : ''}$${realized.toFixed(2)}).`,
+              });
+            } else {
+              setPersistedPositions((prev) =>
+                prev.map((p) =>
+                  p.id === matchingOpen.id
+                    ? { ...p, status: 'CLOSED', markPx: liveMark, realizedPnl: realized }
+                    : p
+                )
+              );
+            }
+          }
+        }
+      } finally {
+        setClosingCoin(null);
+      }
+    },
+    [submitProtectedOrder, persistedPositions, marketsByCoin, user]
+  );
+
+  const handleCloseAllLivePositions = useCallback(async () => {
+    const openPositions = accountSummary?.positions ?? [];
+    if (openPositions.length === 0) {
+      setStatusNotice({ type: 'info', text: 'No tienes posiciones vivas abiertas en Hyperliquid.' });
+      return;
+    }
+    if (!apiPrivateKey.trim()) {
+      soundEngine.alert();
+      voiceEngine.speak('Ingresa tu Agent Private Key para cerrar todas las posiciones.', true);
+      setStatusNotice({
+        type: 'error',
+        text: 'Ingresa tu Agent Private Key para cerrar tus posiciones en Hyperliquid.',
+      });
+      setApiModalOpen(true);
+      return;
+    }
+    setClosingAll(true);
+    voiceEngine.speak(`Cerrando ${openPositions.length} posiciones abiertas en Hyperliquid.`, true);
+    try {
+      for (const pos of openPositions) {
+        await handleCloseLivePosition(pos.coin, pos.side, Math.abs(pos.szi), 'Cierre masivo 1-toque');
+      }
+    } finally {
+      setClosingAll(false);
+    }
+  }, [accountSummary, apiPrivateKey, handleCloseLivePosition]);
+
+  // Unified Brain Cycle (10-Strategy Matrix + Multi-TF Candles + L2 Depth + DB Cross-Reference)
   const runUnifiedBrainCycle = useCallback(async () => {
     if (markets.length === 0 || brainThinking) return;
     setBrainThinking(true);
 
     try {
       const minVolUsd = (config.minVolumeM || 2) * 1_000_000;
-      const sortedCandidates = [...markets]
-        .filter((m) => m.dayNtlVlm >= minVolUsd)
-        .sort((a, b) => b.quantScore - a.quantScore);
+      const liquidByVol = [...markets].filter((m) => m.dayNtlVlm >= minVolUsd);
+      const preFiltered = [...liquidByVol].sort((a, b) => {
+        const turnoverA = a.openInterestUsd > 0 ? Math.min(10, a.dayNtlVlm / a.openInterestUsd) : 0;
+        const turnoverB = b.openInterestUsd > 0 ? Math.min(10, b.dayNtlVlm / b.openInterestUsd) : 0;
+        return b.quantScore + turnoverB - (a.quantScore + turnoverA);
+      });
 
-      // Mode 1: Pure Quantitative Pro Master Unified Strategy
+      // Always include BTC + top 4 highest-volume leaders + top 4 momentum/quant candidates (deduplicated, max 8)
+      const scanMap = new Map<string, HlAssetMarket>();
+      const btcMarket = marketsByCoin.get('BTC');
+      if (btcMarket) scanMap.set('BTC', btcMarket);
+      for (const m of liquidByVol.slice(0, 4)) scanMap.set(m.coin, m);
+      for (const m of preFiltered.slice(0, 6)) {
+        if (scanMap.size >= 8) break;
+        scanMap.set(m.coin, m);
+      }
+      const topForDeepScan = Array.from(scanMap.values());
+
+      if (topForDeepScan.length === 0) {
+        setStatusNotice({
+          type: 'info',
+          text: `Ningún token supera el volumen mínimo de $${config.minVolumeM || 2}M para análisis profundo.`,
+        });
+        return;
+      }
+
+      // Fetch real 15m + 1h candles and L2 orderbook depth for top candidates in parallel
+      const rawDeepAnalyses: DeepAssetAnalysis[] = await Promise.all(
+        topForDeepScan.map(async (c) => {
+          try {
+            const [c15, c1h, book] = await Promise.all([
+              fetchCandles(config.network, c.coin, '15m', 96),
+              fetchCandles(config.network, c.coin, '1h', 60),
+              fetchL2Book(config.network, c.coin),
+            ]);
+            return evaluateUnifiedDeepSetup({
+              market: c,
+              candles15m: c15,
+              candles1h: c1h,
+              bids: book.bids,
+              asks: book.asks,
+              playbook: strategyPlaybook,
+              memories: aiMemories,
+            });
+          } catch {
+            return evaluateUnifiedDeepSetup({
+              market: c,
+              candles15m: [],
+              candles1h: [],
+              bids: [],
+              asks: [],
+              playbook: strategyPlaybook,
+              memories: aiMemories,
+            });
+          }
+        })
+      );
+
+      // BTC Macro Leader Alignment: penalize altcoin trades directly fighting a locked BTC trend
+      const btcDeep = rawDeepAnalyses.find((d) => d.coin === 'BTC');
+      const deepAnalyses: DeepAssetAnalysis[] = rawDeepAnalyses.map((d) => {
+        if (d.coin === 'BTC' || d.direction === 'NEUTRAL' || !btcDeep) return d;
+        const btcStrongBear = btcDeep.regime === 'TRENDING_BEAR' || btcDeep.direction === 'SHORT';
+        const btcStrongBull = btcDeep.regime === 'TRENDING_BULL' || btcDeep.direction === 'LONG';
+        if ((btcStrongBear && d.direction === 'LONG' && d.unifiedScore < 76) ||
+            (btcStrongBull && d.direction === 'SHORT' && d.unifiedScore < 76)) {
+          return {
+            ...d,
+            direction: 'NEUTRAL',
+            unifiedScore: Math.round(d.unifiedScore * 0.7),
+            confidence: Math.min(48, d.confidence),
+            reasons: [...d.reasons, `Bloqueado: va en contra del líder BTC (${btcDeep.regime})`].slice(0, 5),
+          };
+        }
+        return d;
+      });
+
+      const openPositions = accountSummary?.positions || [];
+      const maxOpen = Math.max(1, config.maxOpenPositions || 3);
+
+      // Mode 1: Pure Quantitative 10-Strategy Unified Engine
       if (config.mode === 'strategy') {
-        const best = sortedCandidates.find(
-          (c) => c.quantBias !== 'NEUTRAL' && c.quantScore >= config.minQuantScore
-        );
+        const best = [...deepAnalyses]
+          .filter(
+            (d) =>
+              d.direction !== 'NEUTRAL' &&
+              !d.antiChaseBlocked &&
+              d.unifiedScore >= config.minQuantScore &&
+              !openPositions.some((p) => p.coin === d.coin && p.side === d.direction)
+          )
+          .sort((a, b) => b.unifiedScore - a.unifiedScore)[0];
+
         if (!best) {
+          const topSummary = deepAnalyses[0]
+            ? `${deepAnalyses[0].coin}: ${deepAnalyses[0].unifiedScore} pts (${deepAnalyses[0].regime})`
+            : 'sin candidatos';
           await logEvent(
             'INFO',
             'STRATEGY',
             'SCAN',
-            `Escaneo Pro Master completado: sin confluencia >= ${config.minQuantScore} pts.`
+            `Escaneo multi-TF (15M+1H+L2) en ${topForDeepScan.length} líderes: sin confluencia limpia >= ${config.minQuantScore} pts (${topSummary}).`
           );
           voiceEngine.speak(
-            `Escaneo de estrategia completado en ${markets.length} tokens, sin señal suficiente aún.`
+            `Escaneo multi temporal completado en ${topForDeepScan.length} líderes, sin entrada limpia aún.`
           );
           setLastDecision({
             action: 'HOLD',
             coin: 'NONE',
-            confidence: 45,
-            regime: 'Sin Confluencia',
-            reason: `Ningún token cumple el umbral cuantitativo unificado (>=${config.minQuantScore} pts).`,
+            confidence: deepAnalyses[0]?.unifiedScore ?? 45,
+            regime: deepAnalyses[0]?.regime || 'Sin Confluencia',
+            reason: `Ningún token cumple >=2 estrategias sin sobreextensión (>=${config.minQuantScore} pts). Mejor candidato: ${topSummary}.`,
             tpPct: config.tpPct,
             slPct: config.slPct,
-            modelUsed: 'Pro Master Quant Engine',
+            modelUsed: 'TUG777 10-Strategy Matrix',
           });
           return;
         }
 
+        const asset = marketsByCoin.get(best.coin);
+        const strategyLabel = best.firedStrategies.join(', ');
         const decision: AiBrainDecision = {
-          action: best.quantBias === 'LONG' ? 'LONG' : 'SHORT',
+          action: best.direction as 'LONG' | 'SHORT',
           coin: best.coin,
-          confidence: best.quantScore,
-          regime: 'Confluencia Cuantitativa',
-          reason: best.quantSignals.join(' · '),
-          tpPct: config.tpPct,
-          slPct: config.slPct,
-          modelUsed: 'Pro Master Quant Engine',
+          confidence: best.confidence,
+          regime: best.regime,
+          reason: `[${strategyLabel}] ${best.reasons.join(' · ')}`,
+          tpPct: best.recommendedTpPct,
+          slPct: best.recommendedSlPct,
+          strategiesUsed: best.firedStrategies,
+          modelUsed: 'TUG777 10-Strategy Matrix',
         };
         setLastDecision(decision);
         voiceEngine.speak(
-          `Señal de estrategia detectada. ${decision.action} en ${best.coin} con ${decision.confidence} por ciento de confianza. ${decision.reason}`,
+          `Señal multi estrategia detectada. ${decision.action} en ${best.coin} con ${decision.confidence} por ciento de confianza en régimen ${best.regime}.`,
           true
         );
         await logEvent('INFO', 'STRATEGY', best.coin, `${decision.action} (${decision.confidence}%): ${decision.reason}`);
 
-        if (apiPrivateKey.trim()) {
+        if (openPositions.length >= maxOpen) {
+          await logEvent(
+            'INFO',
+            'RISK_CAP',
+            best.coin,
+            `Límite de ${maxOpen} posiciones simultáneas alcanzado; entrada omitida hasta cerrar una posición.`
+          );
+          return;
+        }
+
+        if (apiPrivateKey.trim() && asset) {
+          const orderUsd = computeDynamicOrderNotionalUsd({
+            config,
+            accountSummary,
+            asset,
+          });
           await submitProtectedOrder({
             coin: best.coin,
             side: decision.action as 'LONG' | 'SHORT',
-            notionalUsd: config.riskPerTradeUsd,
+            notionalUsd: orderUsd,
             mode: 'strategy',
             thesis: decision.reason,
+            strategyTag: best.firedStrategies.join(','),
           });
         }
         return;
       }
 
-      // Mode 2 & 3: Gemini AI Brain or BYO-AI External Endpoint + Optional Search Grounding
+      // Mode 2 & 3: Gemini AI Brain or BYO-AI External Endpoint + Unified DB Playbook + Fills History
       let currentMacro = macroBrief;
       if (!currentMacro && config.aiProvider === 'gemini' && config.useSearchGrounding) {
-        const macroRes = await fetch('/api/ai/macro-radar', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ coins: sortedCandidates.slice(0, 5).map((c) => c.coin) }),
-        });
-        if (macroRes.ok) {
-          const macroData = await macroRes.json();
-          currentMacro = macroData.summary || '';
-          setMacroBrief(currentMacro);
-          setMacroSources(macroData.sources || []);
+        try {
+          const macroRes = await fetch('/api/ai/macro-radar', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+            body: JSON.stringify({ coins: topForDeepScan.slice(0, 5).map((c) => c.coin) }),
+          });
+          if (macroRes.ok) {
+            const macroData = await parseAiJson<{
+              summary?: string;
+              sources?: Array<{ uri: string; title: string }>;
+            }>(macroRes);
+            currentMacro = macroData.summary || '';
+            setMacroBrief(currentMacro);
+            setMacroSources(macroData.sources || []);
+          }
+        } catch {
+          // macro grounding is optional
         }
       }
 
-      const aiRes = await fetch('/api/ai/analyze-market', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          mode: config.mode,
-          candidates: sortedCandidates.slice(0, 12),
-          memories: aiMemories.slice(0, 15),
-          openPositions: accountSummary?.positions || [],
-          macroBrief: currentMacro,
-          deepThinking: config.useDeepThinking,
-          aiProvider: config.aiProvider,
-          customAiUrl: config.customAiUrl,
-          customAiModel: config.customAiModel,
-          customSystemPrompt: config.customSystemPrompt,
-          tpPct: config.tpPct,
-          slPct: config.slPct,
-        }),
-      });
+      let decision: AiBrainDecision & { error?: string; quotaExceeded?: boolean };
+      try {
+        const aiRes = await fetch('/api/ai/analyze-market', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({
+            mode: config.mode,
+            candidates: preFiltered.slice(0, 12),
+            deepAnalyses,
+            playbook: strategyPlaybook,
+            positionGuide: POSITION_MANAGEMENT_GUIDE_RULES,
+            fillsSummary,
+            memories: aiMemories.slice(0, 15),
+            openPositions,
+            macroBrief: currentMacro,
+            deepThinking: config.useDeepThinking,
+            aiProvider: config.aiProvider,
+            customAiUrl: config.customAiUrl,
+            customAiModel: config.customAiModel,
+            customSystemPrompt: config.customSystemPrompt,
+            tpPct: config.tpPct,
+            slPct: config.slPct,
+          }),
+        });
 
-      const decision = (await aiRes.json()) as AiBrainDecision & { error?: string; quotaExceeded?: boolean };
-      if (!aiRes.ok || decision.error) {
-        throw new Error(decision.error || 'Error en respuesta del Cerebro IA');
+        decision = await parseAiJson<AiBrainDecision & { error?: string; quotaExceeded?: boolean }>(aiRes);
+        if (!aiRes.ok || decision.error) {
+          throw new Error(decision.error || 'Error en respuesta del Cerebro IA');
+        }
+      } catch (aiErr) {
+        const bestLocal = [...deepAnalyses]
+          .filter((d) => d.direction !== 'NEUTRAL' && !d.antiChaseBlocked && d.unifiedScore >= config.minQuantScore)
+          .sort((a, b) => b.unifiedScore - a.unifiedScore)[0];
+        if (!bestLocal) {
+          throw aiErr;
+        }
+        decision = {
+          action: bestLocal.direction as 'LONG' | 'SHORT',
+          coin: bestLocal.coin,
+          confidence: bestLocal.confidence,
+          regime: bestLocal.regime,
+          reason: `Respaldo local 10-Estrategias [${bestLocal.firedStrategies.join(', ')}]: ${bestLocal.reasons.join(' · ')}`,
+          tpPct: bestLocal.recommendedTpPct,
+          slPct: bestLocal.recommendedSlPct,
+          strategiesUsed: bestLocal.firedStrategies,
+          modelUsed: 'TUG777 10-Strategy Matrix (Local)',
+        };
       }
 
       if (decision.quotaExceeded) {
         setStatusNotice({
           type: 'info',
-          text: 'Cuota gratuita de Gemini alcanzada (429). Se activó el Fallback Cuantitativo automático; configura facturación en Settings > Secrets o conecta tu IA propia en "Parámetros IA".',
+          text: 'Cuota gratuita de Gemini alcanzada (429). Se activó el Fallback de la Matriz 10-Estrategias; conecta tu IA propia en "Parámetros IA" si prefieres LLM externo.',
         });
       }
 
@@ -788,6 +1150,11 @@ export default function App() {
       if (decision.action === 'HOLD') {
         voiceEngine.speak(
           `Señal del cerebro unificado: mantener espera. ${decision.reason}`
+        );
+      } else if (decision.action === 'CLOSE') {
+        voiceEngine.speak(
+          `El cerebro ordena cerrar posición en ${decision.coin}. ${decision.reason}`,
+          true
         );
       } else {
         voiceEngine.speak(
@@ -802,18 +1169,62 @@ export default function App() {
         `[${decision.modelUsed}] ${decision.action} · Confianza ${decision.confidence}% · ${decision.reason}`
       );
 
+      // Handle explicit CLOSE decision from AI Brain on an open Hyperliquid position
+      if (decision.action === 'CLOSE' && decision.coin !== 'NONE' && apiPrivateKey.trim()) {
+        const openPos = openPositions.find((p) => p.coin === decision.coin);
+        if (openPos) {
+          await handleCloseLivePosition(
+            openPos.coin,
+            openPos.side,
+            Math.abs(openPos.szi),
+            `Cierre táctico Cerebro IA: ${decision.reason}`
+          );
+        }
+        return;
+      }
+
       if (
         (decision.action === 'LONG' || decision.action === 'SHORT') &&
         decision.confidence >= config.minConfidence &&
         decision.coin !== 'NONE' &&
         apiPrivateKey.trim()
       ) {
+        const alreadySameSide = openPositions.some(
+          (p) => p.coin === decision.coin && p.side === decision.action
+        );
+        if (alreadySameSide) {
+          await logEvent(
+            'INFO',
+            'RISK_CAP',
+            decision.coin,
+            `Ya existe posición ${decision.action} abierta en ${decision.coin}; evitando duplicado.`
+          );
+          return;
+        }
+        if (openPositions.length >= maxOpen) {
+          await logEvent(
+            'INFO',
+            'RISK_CAP',
+            decision.coin,
+            `Límite de ${maxOpen} posiciones simultáneas alcanzado; entrada omitida.`
+          );
+          return;
+        }
+
+        const asset = marketsByCoin.get(decision.coin);
+        if (!asset) return;
+        const orderUsd = computeDynamicOrderNotionalUsd({
+          config,
+          accountSummary,
+          asset,
+        });
         await submitProtectedOrder({
           coin: decision.coin,
           side: decision.action,
-          notionalUsd: config.riskPerTradeUsd,
+          notionalUsd: orderUsd,
           mode: config.mode,
           thesis: `${decision.regime}: ${decision.reason}`,
+          strategyTag: decision.strategiesUsed?.join(',') || '',
         });
       }
     } catch (err) {
@@ -826,14 +1237,18 @@ export default function App() {
     }
   }, [
     markets,
+    marketsByCoin,
     brainThinking,
     config,
     macroBrief,
     aiMemories,
+    strategyPlaybook,
+    fillsSummary,
     accountSummary,
     apiPrivateKey,
     logEvent,
     submitProtectedOrder,
+    handleCloseLivePosition,
   ]);
 
   // Auto-run cycle using configured cadence (default 180s to protect free-tier quota)
@@ -847,33 +1262,198 @@ export default function App() {
     return () => clearInterval(timer);
   }, [config.aiEnabled, config.scanIntervalSec]);
 
-  const handleCloseLivePosition = async (coin: string, side: 'LONG' | 'SHORT', size: number) => {
-    setClosingCoin(coin);
+  // Active Live Position Management Loop (SL, TP, Breakeven Lock, Trailing Stop, Regime Invalidation)
+  const runPositionManagerCycle = useCallback(async () => {
+    if (
+      managingPositionsRef.current ||
+      !config.aiEnabled ||
+      !config.autoManagePositions ||
+      !apiPrivateKey.trim()
+    ) {
+      return;
+    }
+    const openPositions = accountSummary?.positions || [];
+    if (openPositions.length === 0) return;
+
+    managingPositionsRef.current = true;
     try {
-      await submitProtectedOrder({
-        coin,
-        side: side === 'LONG' ? 'SHORT' : 'LONG',
-        notionalUsd: 0,
-        mode: 'manual',
-        thesis: 'Cierre manual reduceOnly desde panel de posiciones',
-        reduceOnly: true,
-        overrideSizeCoins: size,
+      for (const pos of openPositions) {
+        const asset = marketsByCoin.get(pos.coin);
+        if (!asset) continue;
+
+        const [c15, c1h, book] = await Promise.all([
+          fetchCandles(config.network, pos.coin, '15m', 96),
+          fetchCandles(config.network, pos.coin, '1h', 60),
+          fetchL2Book(config.network, pos.coin),
+        ]);
+
+        const deep = evaluateUnifiedDeepSetup({
+          market: asset,
+          candles15m: c15,
+          candles1h: c1h,
+          bids: book.bids,
+          asks: book.asks,
+          playbook: strategyPlaybook,
+          memories: aiMemories,
+        });
+
+        const mgr = evaluateOpenPositionManagement({
+          position: pos,
+          deepAnalysis: deep,
+          config,
+          peakMovePct: peakMoveByCoinRef.current[pos.coin] ?? 0,
+        });
+        peakMoveByCoinRef.current[pos.coin] = mgr.peakMovePct;
+
+        if (mgr.action !== 'HOLD') {
+          await logEvent('EXEC', mgr.action, pos.coin, mgr.reason);
+          voiceEngine.speak(`Gestión activa en ${pos.coin}. ${mgr.reason}`, true);
+          await handleCloseLivePosition(pos.coin, pos.side, mgr.size, mgr.reason);
+        }
+      }
+    } catch (err) {
+      console.error('Position manager cycle error:', err);
+    } finally {
+      managingPositionsRef.current = false;
+    }
+  }, [
+    config,
+    apiPrivateKey,
+    accountSummary,
+    marketsByCoin,
+    strategyPlaybook,
+    aiMemories,
+    logEvent,
+    handleCloseLivePosition,
+  ]);
+
+  const posManagerRef = useRef(runPositionManagerCycle);
+  posManagerRef.current = runPositionManagerCycle;
+  useEffect(() => {
+    if (!config.aiEnabled || !config.autoManagePositions) return;
+    const timer = setInterval(() => void posManagerRef.current(), 15000);
+    return () => clearInterval(timer);
+  }, [config.aiEnabled, config.autoManagePositions]);
+
+  // Distill Real Hyperliquid Fills History into Firestore AI Memory & Strategy Rules
+  const handleLearnFromHistory = useCallback(async () => {
+    if (fillsSummary.totalClosed === 0) {
+      soundEngine.alert();
+      voiceEngine.speak('No hay trades cerrados en el historial de Hyperliquid todavía.', true);
+      setStatusNotice({
+        type: 'info',
+        text: 'Conecta tu Master Wallet y realiza cierres reales para que la IA analice tu historial de Hyperliquid.',
+      });
+      return;
+    }
+
+    setLearningHistory(true);
+    soundEngine.click();
+    try {
+      const lessons: Array<Omit<AiMemoryEntry, 'id' | 'ownerId' | 'createdAtMs'>> = [];
+
+      for (const bad of fillsSummary.losingCoins.slice(0, 3)) {
+        lessons.push({
+          coin: bad.coin,
+          regime: 'Auditoría Historial Real',
+          outcome: 'LOSS',
+          pnlUsd: bad.netPnl,
+          lesson: `Evitar sobreoperar ${bad.coin} sin confluencia MTF (>=2 estrategias): suma ${bad.losses} pérdidas (${bad.netPnl.toFixed(2)} USD neto). Exigir pullback limpio y SL estricto.`,
+        });
+      }
+
+      for (const good of fillsSummary.winningCoins.slice(0, 2)) {
+        lessons.push({
+          coin: good.coin,
+          regime: 'Auditoría Historial Real',
+          outcome: 'WIN',
+          pnlUsd: good.netPnl,
+          lesson: `${good.coin} muestra ventaja probada (${good.wins}W/${good.losses}L, +$${good.netPnl.toFixed(2)} neto). Priorizar setups con Trailing Stop activo para dejar correr ganancias.`,
+        });
+      }
+
+      if (fillsSummary.totalFeesUsd > Math.abs(fillsSummary.netPnlUsd) * 0.45 && fillsSummary.totalFeesUsd > 1) {
+        lessons.push({
+          coin: 'ALL',
+          regime: 'Control de Fees',
+          outcome: fillsSummary.netPnlUsd >= 0 ? 'BREAKEVEN' : 'LOSS',
+          pnlUsd: -fillsSummary.totalFeesUsd,
+          lesson: `Comisiones acumuladas altas ($${fillsSummary.totalFeesUsd.toFixed(2)}). Evitar scalps de poco recorrido (<1%) y escalar tamaño dinámico sobre equity con R:R >= 1:2.1.`,
+        });
+      }
+
+      if (user) {
+        for (const l of lessons) {
+          await appendAiMemory(user.uid, l);
+        }
+      } else {
+        setAiMemories((prev) => [
+          ...lessons.map((l, idx) => ({
+            ...l,
+            id: `hist-${Date.now()}-${idx}`,
+            ownerId: 'local',
+            createdAtMs: Date.now(),
+          })),
+          ...prev,
+        ]);
+      }
+
+      soundEngine.tradeExecuted();
+      voiceEngine.speak(
+        `Historial analizado. ${lessons.length} reglas tácticas guardadas en la base de datos a partir de ${fillsSummary.totalClosed} trades reales.`,
+        true
+      );
+      setStatusNotice({
+        type: 'ok',
+        text: `Historial real de Hyperliquid (${fillsSummary.totalClosed} trades · PnL neto ${fillsSummary.netPnlUsd >= 0 ? '+' : ''}$${fillsSummary.netPnlUsd.toFixed(2)} · Fees $${fillsSummary.totalFeesUsd.toFixed(2)}) destilado en ${lessons.length} reglas en Firestore.`,
+      });
+    } catch (err) {
+      soundEngine.alert();
+      setStatusNotice({
+        type: 'error',
+        text: `Error analizando historial: ${err instanceof Error ? err.message : String(err)}`,
       });
     } finally {
-      setClosingCoin(null);
+      setLearningHistory(false);
     }
-  };
+  }, [fillsSummary, user]);
 
   const handleClosePersistedAndLearn = async (pos: PersistedPosition) => {
-    if (!user) return;
+    const liveMatch = accountSummary?.positions.find((p) => p.coin === pos.coin);
+    if (liveMatch) {
+      await handleCloseLivePosition(
+        liveMatch.coin,
+        liveMatch.side,
+        Math.abs(liveMatch.szi),
+        'Cierre unificado desde Posiciones Persistidas'
+      );
+      return;
+    }
+
     const liveMark = marketsByCoin.get(pos.coin)?.markPx ?? pos.markPx;
     const realized = (pos.side === 'LONG' ? liveMark - pos.entryPx : pos.entryPx - liveMark) * pos.size;
+
+    if (!user) {
+      setPersistedPositions((prev) =>
+        prev.map((p) => (p.id === pos.id ? { ...p, status: 'CLOSED', markPx: liveMark, realizedPnl: realized } : p))
+      );
+      soundEngine.tradeExecuted();
+      setStatusNotice({
+        type: 'ok',
+        text: `Registro local de ${pos.coin} cerrado (${realized >= 0 ? '+' : ''}$${realized.toFixed(2)}).`,
+      });
+      return;
+    }
+
     await closePersistedPosition(user.uid, pos.id, liveMark, realized);
+    if (pos.strategyTag) {
+      await recordStrategyTradeOutcome(user.uid, pos.strategyTag.split(','), realized);
+    }
 
     try {
       const res = await fetch('/api/ai/post-trade-lesson', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({
           coin: pos.coin,
           side: pos.side,
@@ -888,7 +1468,11 @@ export default function App() {
         }),
       });
       if (res.ok) {
-        const learned = await res.json();
+        const learned = await parseAiJson<{
+          regime: string;
+          outcome: 'WIN' | 'LOSS' | 'BREAKEVEN';
+          lesson: string;
+        }>(res);
         await appendAiMemory(user.uid, {
           coin: pos.coin,
           regime: learned.regime,
@@ -896,18 +1480,22 @@ export default function App() {
           pnlUsd: realized,
           lesson: learned.lesson,
         });
-        soundEngine.tradeExecuted();
-        voiceEngine.speak(
-          `Posición en ${pos.coin} cerrada con ${realized >= 0 ? 'ganancia' : 'pérdida'} de ${Math.abs(realized).toFixed(2)} dólares. Lección guardada en la base de datos.`,
-          true
-        );
-        setStatusNotice({
-          type: 'ok',
-          text: `Posición ${pos.coin} cerrada y lección aprendida guardada en Firestore.`,
-        });
       }
+      soundEngine.tradeExecuted();
+      voiceEngine.speak(
+        `Posición en ${pos.coin} cerrada con ${realized >= 0 ? 'ganancia' : 'pérdida'} de ${Math.abs(realized).toFixed(2)} dólares. Lección guardada en la base de datos.`,
+        true
+      );
+      setStatusNotice({
+        type: 'ok',
+        text: `Posición ${pos.coin} cerrada y lección aprendida guardada en Firestore.`,
+      });
     } catch (err) {
       console.error('Learn loop error:', err);
+      setStatusNotice({
+        type: 'ok',
+        text: `Posición ${pos.coin} cerrada en Firestore.`,
+      });
     }
   };
 
@@ -932,7 +1520,7 @@ export default function App() {
         }
         const res = await fetch('/api/ai/chat', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
           body: JSON.stringify({
             history: chatMessages.map((m) => ({ role: m.role, content: m.content })),
             message,
@@ -957,7 +1545,7 @@ export default function App() {
             },
           }),
         });
-        const data = await res.json();
+        const data = await parseAiJson<{ reply: string; modelUsed?: string; error?: string }>(res);
         if (!res.ok) throw new Error(data?.error || 'Error en chat IA');
 
         if (user) {
@@ -1144,6 +1732,7 @@ export default function App() {
       refreshAccountData,
       handleSaveAppConfig,
       submitProtectedOrder,
+      handleCloseLivePosition,
       handleSendChat,
     ]
   );
@@ -1176,17 +1765,12 @@ export default function App() {
 
   const handleApkAction = async () => {
     soundEngine.tradeExecuted();
-    if (isInstallable) {
-      voiceEngine.speak('Iniciando instalación de la aplicación en tu dispositivo.', true);
-      await triggerPwaInstall();
-    } else {
-      voiceEngine.speak('Descargando paquete Android A P K.', true);
-      await downloadAndroidApkKit(window.location.origin);
-      setStatusNotice({
-        type: 'ok',
-        text: 'Kit Android APK descargado. También puedes instalarla directo desde Chrome Android ("Instalar aplicación").',
-      });
-    }
+    voiceEngine.speak('Descargando archivo instalador Android A P K.', true);
+    await downloadAndroidApkKit(window.location.origin);
+    setStatusNotice({
+      type: 'ok',
+      text: 'Descargando TUG777-HyperTrade.apk (APK real firmado). Ábrelo en tu Android y permite "Instalar apps desconocidas" para instalarlo.',
+    });
   };
 
   const filteredMarkets = useMemo(() => {
@@ -1585,6 +2169,12 @@ export default function App() {
             </div>
 
             <div className="lg:col-span-4 flex flex-wrap lg:justify-end items-center gap-3 text-[11px] font-mono-tabular text-slate-400">
+              <span className="text-slate-300">
+                {config.sizingMode === 'equity_pct'
+                  ? `Capital ${config.capitalPctPerTrade}%`
+                  : `Fijo $${config.riskPerTradeUsd}`}
+                {config.autoManagePositions ? ' · Gestión Activa' : ''}
+              </span>
               <span className="inline-flex items-center gap-1 text-emerald-400">
                 <ShieldCheck className="w-3.5 h-3.5" />
                 MEV Guard {config.mevShieldEnabled ? 'ON' : 'OFF'}
@@ -1630,6 +2220,95 @@ export default function App() {
               </div>
             )}
 
+            {/* 1-Tap Live Open Positions Quick-Close Strip (Zero Tab-Switching) */}
+            {accountSummary && accountSummary.positions.length > 0 && (
+              <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg p-3.5 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-3 text-xs">
+                    <span className="font-bold text-slate-100">
+                      Posiciones Abiertas ({accountSummary.positions.length})
+                    </span>
+                    {(() => {
+                      const totalPnl = accountSummary.positions.reduce((s, p) => s + p.unrealizedPnl, 0);
+                      return (
+                        <span
+                          className={`font-mono-tabular font-semibold ${
+                            totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+                          }`}
+                        >
+                          PnL Vivo: {totalPnl >= 0 ? '+' : ''}${totalPnl.toFixed(2)}
+                        </span>
+                      );
+                    })()}
+                  </div>
+                  <button
+                    type="button"
+                    disabled={closingAll}
+                    onClick={() => {
+                      soundEngine.click();
+                      void handleCloseAllLivePositions();
+                    }}
+                    className="px-3 py-1.5 rounded-md bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white text-[11px] font-bold inline-flex items-center gap-1.5 transition-colors"
+                  >
+                    <XCircle className="w-3.5 h-3.5" />
+                    {closingAll
+                      ? 'Cerrando Todas...'
+                      : apiPrivateKey.trim()
+                      ? 'Cerrar Todas (1 Toque)'
+                      : 'Key + Cerrar Todas'}
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                  {accountSummary.positions.map((pos) => (
+                    <div
+                      key={pos.coin}
+                      className="flex items-center justify-between gap-2 px-3 py-2 rounded-md bg-[#090B0E] border border-slate-800/80"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => {
+                          soundEngine.click();
+                          setSelectedCoin(pos.coin);
+                        }}
+                        className="text-left min-w-0"
+                      >
+                        <div className="flex items-center gap-1.5 text-xs">
+                          <span className="font-bold text-slate-100">{pos.coin}</span>
+                          <span
+                            className={`font-semibold ${
+                              pos.side === 'LONG' ? 'text-emerald-400' : 'text-red-400'
+                            }`}
+                          >
+                            {pos.side}
+                          </span>
+                          <span className="text-slate-500 font-mono-tabular">{pos.leverage}x</span>
+                        </div>
+                        <div
+                          className={`text-[11px] font-mono-tabular font-semibold ${
+                            pos.unrealizedPnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+                          }`}
+                        >
+                          {pos.unrealizedPnl >= 0 ? '+' : ''}${pos.unrealizedPnl.toFixed(2)} ({pos.returnOnEquity.toFixed(1)}%)
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={closingCoin === pos.coin || closingAll}
+                        onClick={() => {
+                          soundEngine.click();
+                          void handleCloseLivePosition(pos.coin, pos.side, Math.abs(pos.szi));
+                        }}
+                        className="px-2.5 py-1.5 rounded bg-red-600/25 hover:bg-red-600 text-red-200 hover:text-white border border-red-500/50 disabled:opacity-40 text-[11px] font-bold inline-flex items-center gap-1 shrink-0 transition-colors"
+                      >
+                        <XCircle className="w-3 h-3" />
+                        {closingCoin === pos.coin ? 'Cerrando...' : 'Cerrar'}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Chart + L2 Orderbook & Execution Split */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-stretch">
               <div className="lg:col-span-8">
@@ -1643,25 +2322,50 @@ export default function App() {
                 />
               </div>
               <div className="lg:col-span-4">
-                <OrderBookPanel
-                  asset={selectedAsset}
-                  bids={l2Book.bids}
-                  asks={l2Book.asks}
-                  hasApiKey={Boolean(apiPrivateKey.trim())}
-                  mevShieldEnabled={config.mevShieldEnabled}
-                  defaultNotionalUsd={config.riskPerTradeUsd}
-                  executing={executing}
-                  onOpenApiModal={() => setApiModalOpen(true)}
-                  onManualOrder={(side, usd) =>
-                    void submitProtectedOrder({
-                      coin: selectedCoin,
-                      side,
-                      notionalUsd: usd,
-                      mode: 'manual',
-                      thesis: `Orden manual ${side} con Escudo Anti-MEV`,
-                    })
-                  }
-                />
+                {(() => {
+                  const activePos = accountSummary?.positions.find((p) => p.coin === selectedCoin);
+                  return (
+                    <OrderBookPanel
+                      asset={selectedAsset}
+                      bids={l2Book.bids}
+                      asks={l2Book.asks}
+                      hasApiKey={Boolean(apiPrivateKey.trim())}
+                      mevShieldEnabled={config.mevShieldEnabled}
+                      defaultNotionalUsd={config.riskPerTradeUsd}
+                      executing={executing}
+                      activePosition={
+                        activePos
+                          ? {
+                              side: activePos.side,
+                              size: Math.abs(activePos.szi),
+                              unrealizedPnl: activePos.unrealizedPnl,
+                            }
+                          : null
+                      }
+                      closingActive={closingCoin === selectedCoin || closingAll}
+                      onQuickClose={
+                        activePos
+                          ? () =>
+                              void handleCloseLivePosition(
+                                activePos.coin,
+                                activePos.side,
+                                Math.abs(activePos.szi)
+                              )
+                          : undefined
+                      }
+                      onOpenApiModal={() => setApiModalOpen(true)}
+                      onManualOrder={(side, usd) =>
+                        void submitProtectedOrder({
+                          coin: selectedCoin,
+                          side,
+                          notionalUsd: usd,
+                          mode: 'manual',
+                          thesis: `Orden manual ${side} con Escudo Anti-MEV`,
+                        })
+                      }
+                    />
+                  );
+                })()}
               </div>
             </div>
 
@@ -1805,10 +2509,12 @@ export default function App() {
             masterWalletAddress={config.masterWalletAddress}
             hasApiKey={Boolean(apiPrivateKey.trim())}
             executingCoin={closingCoin}
+            closingAll={closingAll}
             syncingAccount={syncingAccount}
             lastSyncedAt={lastSyncedAt}
             onRefreshAccount={() => void refreshAccountData(true)}
             onCloseLivePosition={(coin, side, sz) => void handleCloseLivePosition(coin, side, sz)}
+            onCloseAllPositions={() => void handleCloseAllLivePositions()}
             onClosePersistedPosition={(pos) => void handleClosePersistedAndLearn(pos)}
             onOpenApiModal={() => setApiModalOpen(true)}
           />
@@ -1819,10 +2525,22 @@ export default function App() {
             fills={userFills}
             persistedPositions={persistedPositions}
             accountSummary={accountSummary}
+            onLearnFromHistory={() => void handleLearnFromHistory()}
+            learningHistory={learningHistory}
           />
         )}
 
-        {activeTab === 'logs' && <LogsAndMemoryView logs={tradeLogs} memories={aiMemories} />}
+        {activeTab === 'logs' && (
+          <LogsAndMemoryView
+            logs={tradeLogs}
+            memories={aiMemories}
+            playbook={strategyPlaybook}
+            onToggleStrategy={(strategyId, enabled) => {
+              if (!user) return;
+              void toggleStrategyPlaybookItem(user.uid, strategyId, enabled);
+            }}
+          />
+        )}
 
         {activeTab === 'droplet' && (
           <DropletDeployView
@@ -1840,10 +2558,17 @@ export default function App() {
         apiPrivateKey={apiPrivateKey}
         onSave={(saved) => {
           setApiPrivateKey(saved.apiPrivateKey);
+          localStorage.setItem('tug777_remember_pk', saved.rememberKey ? 'true' : 'false');
           if (saved.apiPrivateKey) {
             sessionStorage.setItem('tug777_hl_agent_pk', saved.apiPrivateKey);
+            if (saved.rememberKey) {
+              localStorage.setItem('tug777_hl_agent_pk_saved', saved.apiPrivateKey);
+            } else {
+              localStorage.removeItem('tug777_hl_agent_pk_saved');
+            }
           } else {
             sessionStorage.removeItem('tug777_hl_agent_pk');
+            localStorage.removeItem('tug777_hl_agent_pk_saved');
           }
           void updateConfigPatch({
             network: saved.network,

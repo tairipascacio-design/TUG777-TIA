@@ -28,6 +28,11 @@ export const AiBrainParamsModal: React.FC<AiBrainParamsModalProps> = ({
   const [slPct, setSlPct] = useState(String(config.slPct));
   const [useDeepThinking, setUseDeepThinking] = useState(config.useDeepThinking);
   const [useSearchGrounding, setUseSearchGrounding] = useState(config.useSearchGrounding);
+  const [sizingMode, setSizingMode] = useState<'equity_pct' | 'fixed_usd'>(config.sizingMode || 'equity_pct');
+  const [capitalPctPerTrade, setCapitalPctPerTrade] = useState(String(config.capitalPctPerTrade || 25));
+  const [maxOpenPositions, setMaxOpenPositions] = useState(String(config.maxOpenPositions || 3));
+  const [trailingStopEnabled, setTrailingStopEnabled] = useState(config.trailingStopEnabled !== false);
+  const [autoManagePositions, setAutoManagePositions] = useState(config.autoManagePositions !== false);
 
   if (!open) return null;
 
@@ -47,6 +52,11 @@ export const AiBrainParamsModal: React.FC<AiBrainParamsModalProps> = ({
       slPct: Math.max(0.2, Math.min(50, Number(slPct || 1.4))),
       useDeepThinking,
       useSearchGrounding,
+      sizingMode,
+      capitalPctPerTrade: Math.max(1, Math.min(100, Number(capitalPctPerTrade || 25))),
+      maxOpenPositions: Math.max(1, Math.min(20, Math.round(Number(maxOpenPositions || 3)))),
+      trailingStopEnabled,
+      autoManagePositions,
     });
     onClose();
   };
@@ -62,7 +72,7 @@ export const AiBrainParamsModal: React.FC<AiBrainParamsModalProps> = ({
                 Parámetros del Cerebro IA y Motor Externo
               </h2>
               <p className="text-xs text-slate-400">
-                Configura umbrales cuantitativos, cadencia anti-429 o conecta tu propia IA (Ollama / DeepSeek / OpenAI-Compatible)
+                Configura umbrales multi-estrategia, gestión activa TP/SL/Trailing y escalado de capital
               </p>
             </div>
           </div>
@@ -98,7 +108,7 @@ export const AiBrainParamsModal: React.FC<AiBrainParamsModalProps> = ({
               >
                 <div className="text-xs font-bold">Gemini Integrado (Servidor)</div>
                 <div className="text-[11px] text-slate-400 mt-0.5">
-                  Usa Flash-Lite (baja cuota) o Hydrogen + fallback cuantitativo automático si hay 429.
+                  Usa Flash-Lite (baja cuota) o Hydrogen + fallback 10 estrategias automático si hay 429.
                 </div>
               </button>
               <button
@@ -205,6 +215,104 @@ export const AiBrainParamsModal: React.FC<AiBrainParamsModalProps> = ({
               </div>
             </div>
           )}
+
+          {/* Capital Compounding & Active Position Management */}
+          <div className="p-4 rounded-lg bg-[#090B0E] border border-slate-800 space-y-3">
+            <div className="text-xs font-semibold text-amber-300">
+              Gestión de Capital y Posiciones en Vivo (Sin Tope Fijo de Capital)
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <button
+                type="button"
+                onClick={() => {
+                  soundEngine.click();
+                  setSizingMode('equity_pct');
+                }}
+                className={`p-2.5 rounded border text-left text-xs ${
+                  sizingMode === 'equity_pct'
+                    ? 'bg-emerald-500/15 border-emerald-500 text-slate-100'
+                    : 'bg-[#0F131A] border-slate-800 text-slate-400'
+                }`}
+              >
+                <div className="font-bold">Dinámico (% Equity × Apalancamiento)</div>
+                <div className="text-[11px] text-slate-400 mt-0.5">
+                  Escala automáticamente según crece tu capital en Hyperliquid.
+                </div>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  soundEngine.click();
+                  setSizingMode('fixed_usd');
+                }}
+                className={`p-2.5 rounded border text-left text-xs ${
+                  sizingMode === 'fixed_usd'
+                    ? 'bg-amber-500/15 border-amber-500 text-slate-100'
+                    : 'bg-[#0F131A] border-slate-800 text-slate-400'
+                }`}
+              >
+                <div className="font-bold">Nocional Fijo (USD por Trade)</div>
+                <div className="text-[11px] text-slate-400 mt-0.5">
+                  Usa el monto exacto en USD configurado en tu API Wallet.
+                </div>
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">% Equity / Trade</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={capitalPctPerTrade}
+                  onChange={(e) => setCapitalPctPerTrade(e.target.value)}
+                  className="w-full bg-[#0F131A] border border-slate-700 rounded-md px-2.5 py-1.5 text-xs font-mono-tabular text-slate-100"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">Max Posiciones</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={maxOpenPositions}
+                  onChange={(e) => setMaxOpenPositions(e.target.value)}
+                  className="w-full bg-[#0F131A] border border-slate-700 rounded-md px-2.5 py-1.5 text-xs font-mono-tabular text-slate-100"
+                />
+              </div>
+              <div className="flex flex-col justify-between">
+                <span className="text-[11px] text-slate-400">Gestión Auto TP/SL</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    soundEngine.click();
+                    setAutoManagePositions(!autoManagePositions);
+                  }}
+                  className={`py-1.5 rounded text-xs font-bold ${
+                    autoManagePositions ? 'bg-emerald-600 text-white' : 'bg-slate-800 text-slate-400'
+                  }`}
+                >
+                  {autoManagePositions ? 'ACTIVA' : 'OFF'}
+                </button>
+              </div>
+              <div className="flex flex-col justify-between">
+                <span className="text-[11px] text-slate-400">Trailing + Breakeven</span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    soundEngine.click();
+                    setTrailingStopEnabled(!trailingStopEnabled);
+                  }}
+                  className={`py-1.5 rounded text-xs font-bold ${
+                    trailingStopEnabled ? 'bg-amber-500 text-slate-950' : 'bg-slate-800 text-slate-400'
+                  }`}
+                >
+                  {trailingStopEnabled ? 'ON' : 'OFF'}
+                </button>
+              </div>
+            </div>
+          </div>
 
           {/* Quantitative & Execution Parameters */}
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">

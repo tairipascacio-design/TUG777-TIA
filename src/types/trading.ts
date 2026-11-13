@@ -98,6 +98,69 @@ export interface BotConfigData {
   slPct: number;
   useDeepThinking: boolean;
   useSearchGrounding: boolean;
+  sizingMode: 'equity_pct' | 'fixed_usd';
+  capitalPctPerTrade: number;
+  maxOpenPositions: number;
+  trailingStopEnabled: boolean;
+  autoManagePositions: boolean;
+}
+
+export type MarketRegime =
+  | 'TRENDING_BULL'
+  | 'TRENDING_BEAR'
+  | 'BREAKOUT_EXPANSION'
+  | 'RANGING_CHOP'
+  | 'HIGH_VOLATILITY_SQUEEZE';
+
+export type StrategyCategory = 'TREND' | 'MEAN_REVERSION' | 'MOMENTUM' | 'ORDERFLOW' | 'VOLATILITY';
+
+export interface StrategyPlaybookItem {
+  strategyId: string;
+  ownerId: string;
+  name: string;
+  category: StrategyCategory;
+  preferredRegimes: string;
+  entryRule: string;
+  positionManagementGuide: string;
+  weight: number;
+  wins: number;
+  losses: number;
+  totalPnlUsd: number;
+  enabled: boolean;
+  updatedAtMs: number;
+}
+
+export interface DeepAssetAnalysis {
+  coin: string;
+  markPx: number;
+  regime: MarketRegime;
+  direction: 'LONG' | 'SHORT' | 'NEUTRAL';
+  unifiedScore: number;
+  confidence: number;
+  firedStrategies: string[];
+  rsi14: number;
+  ema9: number;
+  ema21: number;
+  ema55: number;
+  atrPct: number;
+  vwapDistPct: number;
+  bbWidthPct: number;
+  l2Imbalance: number;
+  spreadBps: number;
+  recommendedSlPct: number;
+  recommendedTpPct: number;
+  antiChaseBlocked: boolean;
+  reasons: string[];
+}
+
+export interface PositionManagementDecision {
+  coin: string;
+  side: 'LONG' | 'SHORT';
+  size: number;
+  action: 'HOLD' | 'CLOSE_TP' | 'CLOSE_SL' | 'CLOSE_TRAILING' | 'CLOSE_INVALIDATION';
+  movePct: number;
+  peakMovePct: number;
+  reason: string;
 }
 
 export interface PersistedPosition {
@@ -115,6 +178,7 @@ export interface PersistedPosition {
   mode: TradingMode | 'manual';
   hlOrderId: string;
   thesis: string;
+  strategyTag?: string;
   createdAtMs: number;
   updatedAtMs: number;
 }
@@ -171,4 +235,5 @@ export interface AiBrainDecision {
   tpPct: number;
   slPct: number;
   modelUsed: string;
+  strategiesUsed?: string[];
 }

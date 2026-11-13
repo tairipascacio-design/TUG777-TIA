@@ -19,8 +19,10 @@ import type {
   BotConfigData,
   ChatMessageEntry,
   PersistedPosition,
+  StrategyPlaybookItem,
   TradeLogEntry,
 } from '../types/trading';
+import { DEFAULT_STRATEGY_PLAYBOOK } from './strategyEngine';
 
 const DEFAULT_CONFIG = (uid: string): BotConfigData => ({
   ownerId: uid,
@@ -45,6 +47,11 @@ const DEFAULT_CONFIG = (uid: string): BotConfigData => ({
   slPct: 1.4,
   useDeepThinking: false,
   useSearchGrounding: false,
+  sizingMode: 'equity_pct',
+  capitalPctPerTrade: 25,
+  maxOpenPositions: 3,
+  trailingStopEnabled: true,
+  autoManagePositions: true,
 });
 
 export async function ensureUserProfileAndConfig(user: {
@@ -108,6 +115,11 @@ export async function ensureUserProfileAndConfig(user: {
       slPct: Number(d.slPct || 1.4),
       useDeepThinking: Boolean(d.useDeepThinking),
       useSearchGrounding: Boolean(d.useSearchGrounding),
+      sizingMode: d.sizingMode === 'fixed_usd' ? 'fixed_usd' : 'equity_pct',
+      capitalPctPerTrade: Number(d.capitalPctPerTrade || 25),
+      maxOpenPositions: Number(d.maxOpenPositions || 3),
+      trailingStopEnabled: d.trailingStopEnabled !== false,
+      autoManagePositions: d.autoManagePositions !== false,
     };
   } catch (err) {
     handleFirestoreError(err, OperationType.GET, configPath);
@@ -161,6 +173,12 @@ export async function saveBotConfig(uid: string, patch: Partial<BotConfigData>) 
   if (typeof sanitized.customSystemPrompt === 'string') {
     sanitized.customSystemPrompt = sanitized.customSystemPrompt.slice(0, 1500);
   }
+  if (typeof sanitized.capitalPctPerTrade === 'number') {
+    sanitized.capitalPctPerTrade = Math.max(1, Math.min(100, sanitized.capitalPctPerTrade));
+  }
+  if (typeof sanitized.maxOpenPositions === 'number') {
+    sanitized.maxOpenPositions = Math.max(1, Math.min(20, Math.round(sanitized.maxOpenPositions)));
+  }
 
   try {
     await updateDoc(ref, {
@@ -203,6 +221,7 @@ export function subscribePositions(
           mode: data.mode,
           hlOrderId: data.hlOrderId || '',
           thesis: data.thesis || '',
+          strategyTag: data.strategyTag || '',
           createdAtMs: data.createdAt?.toMillis?.() ?? Date.now(),
           updatedAtMs: data.updatedAt?.toMillis?.() ?? Date.now(),
         };
@@ -233,6 +252,7 @@ export async function createPersistedPosition(
       mode: pos.mode,
       hlOrderId: pos.hlOrderId.slice(0, 128),
       thesis: pos.thesis.slice(0, 600),
+      strategyTag: (pos.strategyTag || '').slice(0, 160),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -416,3 +436,119 @@ export async function appendChatMessage(
     handleFirestoreError(err, OperationType.CREATE, path);
   }
 }
+
+export async function syncStrategyPlaybook(uid: string) {
+  for (const item of DEFAULT_STRATEGY_PLAYBOOK) {
+    const path = `users/${uid}/strategy_playbook/${item.strategyId}`;
+    const ref = doc(db, 'users', uid, 'strategy_playbook', item.strategyId);
+    try {
+      const snap = await getDoc(ref);
+      if (!snap.exists()) {
+        await setDoc(ref, {
+          ownerId: uid,
+          strategyId: item.strategyId,
+          name: item.name.slice(0, 100),
+          category: item.category,
+          preferredRegimes: item.preferredRegimes.slice(0, 180),
+          entryRule: item.entryRule.slice(0, 400),
+          positionManagementGuide: item.positionManagementGuide.slice(0, 400),
+          weight: item.weight,
+          wins: 0,
+          losses: 0,
+          totalPnlUsd: 0,
+          enabled: item.enabled,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, path);
+    }
+  }
+}
+
+export function subscribeStrategyPlaybook(
+  uid: string,
+  onData: (items: StrategyPlaybookItem[]) => void
+): Unsubscribe {
+  const path = `users/${uid}/strategy_playbook`;
+  const q = query(
+    collection(db, 'users', uid, 'strategy_playbook'),
+    where('ownerId', '==', uid),
+    limit(40)
+  );
+  return onSnapshot(
+    q,
+    (snap) => {
+      const items: StrategyPlaybookItem[] = snap.docs.map((d) => {
+        const data = d.data();
+        return {
+          strategyId: data.strategyId || d.id,
+          ownerId: data.ownerId,
+          name: data.name,
+          category: data.category,
+          preferredRegimes: data.preferredRegimes,
+          entryRule: data.entryRule,
+          positionManagementGuide: data.positionManagementGuide,
+          weight: Number(data.weight ?? 1),
+          wins: Number(data.wins ?? 0),
+          losses: Number(data.losses ?? 0),
+          totalPnlUsd: Number(data.totalPnlUsd ?? 0),
+          enabled: data.enabled !== false,
+          updatedAtMs: data.updatedAt?.toMillis?.() ?? Date.now(),
+        };
+      });
+      onData(items);
+    },
+    (error) => handleFirestoreError(error, OperationType.LIST, path)
+  );
+}
+
+export async function recordStrategyTradeOutcome(
+  uid: string,
+  strategyIds: string[],
+  pnlUsd: number
+) {
+  const uniqueIds = Array.from(new Set(strategyIds.filter(Boolean)));
+  const isWin = pnlUsd > 0.05;
+  const isLoss = pnlUsd < -0.05;
+
+  for (const strategyId of uniqueIds) {
+    const path = `users/${uid}/strategy_playbook/${strategyId}`;
+    const ref = doc(db, 'users', uid, 'strategy_playbook', strategyId);
+    try {
+      const snap = await getDoc(ref);
+      if (!snap.exists()) continue;
+      const d = snap.data();
+      const prevWeight = Number(d.weight ?? 1.0);
+      const delta = isWin ? 0.08 : isLoss ? -0.09 : 0;
+      const nextWeight = Number(Math.max(0.3, Math.min(2.5, prevWeight + delta)).toFixed(2));
+      await updateDoc(ref, {
+        wins: Number(d.wins ?? 0) + (isWin ? 1 : 0),
+        losses: Number(d.losses ?? 0) + (isLoss ? 1 : 0),
+        totalPnlUsd: Number((Number(d.totalPnlUsd ?? 0) + pnlUsd).toFixed(4)),
+        weight: nextWeight,
+        updatedAt: serverTimestamp(),
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, path);
+    }
+  }
+}
+
+export async function toggleStrategyPlaybookItem(
+  uid: string,
+  strategyId: string,
+  enabled: boolean
+) {
+  const path = `users/${uid}/strategy_playbook/${strategyId}`;
+  try {
+    await updateDoc(doc(db, 'users', uid, 'strategy_playbook', strategyId), {
+      enabled,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
+  }
+}
+

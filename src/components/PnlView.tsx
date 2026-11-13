@@ -1,16 +1,22 @@
 import React, { useMemo } from 'react';
+import { Brain, AlertTriangle, TrendingUp } from 'lucide-react';
 import type { HlAccountSummary, HlUserFill, PersistedPosition } from '../types/trading';
+import { soundEngine } from '../utils/soundEngine';
 
 interface PnlViewProps {
   fills: HlUserFill[];
   persistedPositions: PersistedPosition[];
   accountSummary: HlAccountSummary | null;
+  onLearnFromHistory?: () => void;
+  learningHistory?: boolean;
 }
 
 export const PnlView: React.FC<PnlViewProps> = ({
   fills,
   persistedPositions,
   accountSummary,
+  onLearnFromHistory,
+  learningHistory = false,
 }) => {
   const analytics = useMemo(() => {
     const closedFromFills = fills.filter((f) => Math.abs(f.closedPnl) > 0.0001);
@@ -21,11 +27,15 @@ export const PnlView: React.FC<PnlViewProps> = ({
         ? closedFromFills.map((f) => ({
             coin: f.coin,
             pnl: f.closedPnl - f.fee,
+            grossPnl: f.closedPnl,
+            fee: f.fee,
             time: f.time,
           }))
         : closedFromDb.map((p) => ({
             coin: p.coin,
             pnl: p.realizedPnl,
+            grossPnl: p.realizedPnl,
+            fee: 0,
             time: p.updatedAtMs,
           }));
 
@@ -41,17 +51,35 @@ export const PnlView: React.FC<PnlViewProps> = ({
     const grossProfit = wins.reduce((s, t) => s + t.pnl, 0);
     const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
     const realizedTotal = realPnlSource.reduce((s, t) => s + t.pnl, 0);
+    const totalFeesUsd = fills.reduce((s, f) => s + f.fee, 0);
+    const avgWin = wins.length > 0 ? grossProfit / wins.length : 0;
+    const avgLoss = losses.length > 0 ? grossLoss / losses.length : 0;
     const unrealizedTotal = (accountSummary?.positions || []).reduce((s, p) => s + p.unrealizedPnl, 0);
     const winRate = realPnlSource.length > 0 ? (wins.length / realPnlSource.length) * 100 : 0;
     const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 9.99 : 0;
+
+    // Breakdown by coin to spot bleeding tokens
+    const byCoinMap = new Map<string, { coin: string; pnl: number; fees: number; count: number }>();
+    for (const f of fills) {
+      const cur = byCoinMap.get(f.coin) || { coin: f.coin, pnl: 0, fees: 0, count: 0 };
+      cur.pnl += f.closedPnl - f.fee;
+      cur.fees += f.fee;
+      cur.count += 1;
+      byCoinMap.set(f.coin, cur);
+    }
+    const coinBreakdown = Array.from(byCoinMap.values()).sort((a, b) => a.pnl - b.pnl);
 
     return {
       curve,
       realizedTotal,
       unrealizedTotal,
+      totalFeesUsd,
+      avgWin,
+      avgLoss,
       winRate,
       profitFactor,
       tradeCount: realPnlSource.length,
+      coinBreakdown,
       sourceLabel: closedFromFills.length > 0 ? 'Hyperliquid Real Fills' : 'Firestore Historial Cerrado',
     };
   }, [fills, persistedPositions, accountSummary]);
@@ -98,17 +126,74 @@ export const PnlView: React.FC<PnlViewProps> = ({
           </p>
         </div>
         <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg p-4">
-          <p className="text-xs text-slate-400">Win Rate ({analytics.tradeCount} trades)</p>
+          <p className="text-xs text-slate-400">Win Rate ({analytics.tradeCount} cierres)</p>
           <p className="mt-1 text-2xl font-bold font-mono-tabular text-amber-400">
             {analytics.winRate.toFixed(1)}%
           </p>
         </div>
         <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg p-4">
-          <p className="text-xs text-slate-400">Profit Factor</p>
+          <p className="text-xs text-slate-400">Profit Factor / Fees</p>
           <p className="mt-1 text-2xl font-bold font-mono-tabular text-slate-100">
-            {analytics.profitFactor.toFixed(2)}
+            {analytics.profitFactor.toFixed(2)}{' '}
+            <span className="text-xs font-normal text-red-400">(-${analytics.totalFeesUsd.toFixed(2)} fee)</span>
           </p>
         </div>
+      </div>
+
+      {/* Real History Diagnostic & Learning Injection */}
+      <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg p-5 space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h2 className="text-base font-bold text-slate-100">
+              Diagnóstico del Historial Real y Retroalimentación a la Base de Datos
+            </h2>
+            <p className="text-xs text-slate-400">
+              Prom. Ganador: <span className="text-emerald-400 font-mono-tabular">+${analytics.avgWin.toFixed(2)}</span> · Prom. Perdedor:{' '}
+              <span className="text-red-400 font-mono-tabular">-${analytics.avgLoss.toFixed(2)}</span> · Comisiones Hyperliquid:{' '}
+              <span className="text-amber-300 font-mono-tabular">${analytics.totalFeesUsd.toFixed(2)}</span>
+            </p>
+          </div>
+          {onLearnFromHistory && (
+            <button
+              disabled={learningHistory || fills.length === 0}
+              onClick={() => {
+                soundEngine.click();
+                onLearnFromHistory();
+              }}
+              className="px-3.5 py-2 rounded-md bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 text-xs font-bold inline-flex items-center gap-1.5"
+            >
+              <Brain className="w-3.5 h-3.5" />
+              {learningHistory ? 'Guardando Lecciones...' : 'Aprender del Historial Real → Firestore'}
+            </button>
+          )}
+        </div>
+
+        {analytics.coinBreakdown.length > 0 && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-2.5">
+            {analytics.coinBreakdown.slice(0, 6).map((cb) => (
+              <div key={cb.coin} className="bg-[#090B0E] border border-slate-800 rounded-md p-2.5 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="font-bold text-slate-100">{cb.coin}</span>
+                  {cb.pnl < 0 ? (
+                    <AlertTriangle className="w-3.5 h-3.5 text-red-400" />
+                  ) : (
+                    <TrendingUp className="w-3.5 h-3.5 text-emerald-400" />
+                  )}
+                </div>
+                <div
+                  className={`mt-1 font-mono-tabular font-semibold ${
+                    cb.pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+                  }`}
+                >
+                  {cb.pnl >= 0 ? '+' : ''}${cb.pnl.toFixed(2)}
+                </div>
+                <div className="text-[10px] text-slate-500 font-mono-tabular">
+                  {cb.count} fills · fee ${cb.fees.toFixed(2)}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Equity Curve */}
@@ -161,7 +246,7 @@ export const PnlView: React.FC<PnlViewProps> = ({
                   </td>
                 </tr>
               ) : (
-                fills.slice(0, 30).map((f, idx) => (
+                fills.slice(0, 50).map((f, idx) => (
                   <tr key={`${f.oid}-${idx}`} className="hover:bg-slate-800/30">
                     <td className="py-2.5 px-4 text-slate-400">
                       {new Date(f.time).toLocaleString()}

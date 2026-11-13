@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ShieldCheck, Zap } from 'lucide-react';
+import { ShieldCheck, XCircle, Zap } from 'lucide-react';
 import type { HlAssetMarket, HlL2Level } from '../types/trading';
 import { soundEngine } from '../utils/soundEngine';
 
@@ -11,6 +11,13 @@ interface OrderBookPanelProps {
   mevShieldEnabled: boolean;
   defaultNotionalUsd: number;
   executing: boolean;
+  activePosition?: {
+    side: 'LONG' | 'SHORT';
+    size: number;
+    unrealizedPnl: number;
+  } | null;
+  closingActive?: boolean;
+  onQuickClose?: () => void;
   onManualOrder: (side: 'LONG' | 'SHORT', notionalUsd: number) => void;
   onOpenApiModal: () => void;
 }
@@ -23,6 +30,9 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
   mevShieldEnabled,
   defaultNotionalUsd,
   executing,
+  activePosition,
+  closingActive = false,
+  onQuickClose,
   onManualOrder,
   onOpenApiModal,
 }) => {
@@ -138,6 +148,32 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
             {asset ? `${(Number(notionalUsd || 0) / asset.markPx).toFixed(4)} ${asset.coin}` : '--'}
           </span>
         </div>
+
+        {activePosition && onQuickClose && (
+          <button
+            type="button"
+            disabled={closingActive || executing}
+            onClick={() => {
+              soundEngine.click();
+              onQuickClose();
+            }}
+            className="w-full py-2.5 px-3 rounded-md bg-red-600/20 hover:bg-red-600 text-red-200 hover:text-white border border-red-500/50 disabled:opacity-50 text-xs font-bold flex items-center justify-between transition-colors"
+          >
+            <span className="inline-flex items-center gap-1.5">
+              <XCircle className="w-3.5 h-3.5" />
+              {closingActive
+                ? `Cerrando ${asset?.coin}...`
+                : `Cerrar ${activePosition.side} ${asset?.coin}`}
+            </span>
+            <span
+              className={`font-mono-tabular ${
+                activePosition.unrealizedPnl >= 0 ? 'text-emerald-300' : 'text-red-300'
+              }`}
+            >
+              {activePosition.unrealizedPnl >= 0 ? '+' : ''}${activePosition.unrealizedPnl.toFixed(2)}
+            </span>
+          </button>
+        )}
 
         {hasApiKey ? (
           <div className="grid grid-cols-2 gap-2">

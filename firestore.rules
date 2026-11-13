@@ -52,7 +52,9 @@ service cloud.firestore {
           'riskPerTradeUsd', 'soundEnabled', 'aiProvider', 'customAiUrl',
           'customAiModel', 'customSystemPrompt', 'scanIntervalSec',
           'minConfidence', 'minQuantScore', 'minVolumeM', 'tpPct', 'slPct',
-          'useDeepThinking', 'useSearchGrounding', 'createdAt', 'updatedAt'
+          'useDeepThinking', 'useSearchGrounding', 'sizingMode',
+          'capitalPctPerTrade', 'maxOpenPositions', 'trailingStopEnabled',
+          'autoManagePositions', 'createdAt', 'updatedAt'
         ])
         && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
         && data.mode in ['strategy', 'ai', 'strategy_ai']
@@ -76,6 +78,11 @@ service cloud.firestore {
         && (!('slPct' in data) || (data.slPct is number && data.slPct >= 0.2 && data.slPct <= 50))
         && (!('useDeepThinking' in data) || data.useDeepThinking is bool)
         && (!('useSearchGrounding' in data) || data.useSearchGrounding is bool)
+        && (!('sizingMode' in data) || data.sizingMode in ['equity_pct', 'fixed_usd'])
+        && (!('capitalPctPerTrade' in data) || (data.capitalPctPerTrade is number && data.capitalPctPerTrade >= 1 && data.capitalPctPerTrade <= 100))
+        && (!('maxOpenPositions' in data) || (data.maxOpenPositions is number && data.maxOpenPositions >= 1 && data.maxOpenPositions <= 20))
+        && (!('trailingStopEnabled' in data) || data.trailingStopEnabled is bool)
+        && (!('autoManagePositions' in data) || data.autoManagePositions is bool)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -89,7 +96,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'ownerId', 'coin', 'side', 'size', 'entryPx', 'markPx', 'leverage',
           'unrealizedPnl', 'realizedPnl', 'status', 'mode', 'hlOrderId', 'thesis',
-          'createdAt', 'updatedAt'
+          'strategyTag', 'createdAt', 'updatedAt'
         ])
         && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
         && data.coin is string && data.coin.size() >= 1 && data.coin.size() <= 32
@@ -104,6 +111,7 @@ service cloud.firestore {
         && data.mode in ['strategy', 'ai', 'strategy_ai', 'manual']
         && data.hlOrderId is string && data.hlOrderId.size() <= 128
         && data.thesis is string && data.thesis.size() <= 600
+        && (!('strategyTag' in data) || (data.strategyTag is string && data.strategyTag.size() <= 160))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -174,7 +182,9 @@ service cloud.firestore {
             'riskPerTradeUsd', 'soundEnabled', 'aiProvider', 'customAiUrl',
             'customAiModel', 'customSystemPrompt', 'scanIntervalSec',
             'minConfidence', 'minQuantScore', 'minVolumeM', 'tpPct', 'slPct',
-            'useDeepThinking', 'useSearchGrounding', 'updatedAt'
+            'useDeepThinking', 'useSearchGrounding', 'sizingMode',
+            'capitalPctPerTrade', 'maxOpenPositions', 'trailingStopEnabled',
+            'autoManagePositions', 'updatedAt'
           ]);
       }
 
@@ -227,6 +237,61 @@ service cloud.firestore {
           && isValidChatMessage(incoming(), userId)
           && incoming().createdAt == request.time;
         allow delete: if isValidId(userId) && isValidId(messageId) && isVerifiedUser() && isOwner(userId);
+      }
+
+      match /strategy_playbook/{strategyId} {
+        allow get: if isValidId(userId) && isValidId(strategyId) && isOwner(userId);
+        allow list: if isOwner(userId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(userId) && isValidId(strategyId) && isVerifiedUser() && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && incoming().keys().hasAll([
+            'ownerId', 'strategyId', 'name', 'category', 'preferredRegimes',
+            'entryRule', 'positionManagementGuide', 'weight', 'wins', 'losses',
+            'totalPnlUsd', 'enabled', 'createdAt', 'updatedAt'
+          ])
+          && incoming().keys().hasOnly([
+            'ownerId', 'strategyId', 'name', 'category', 'preferredRegimes',
+            'entryRule', 'positionManagementGuide', 'weight', 'wins', 'losses',
+            'totalPnlUsd', 'enabled', 'createdAt', 'updatedAt'
+          ])
+          && incoming().ownerId is string && incoming().ownerId == userId && isValidId(incoming().ownerId)
+          && incoming().strategyId is string && incoming().strategyId == strategyId && isValidId(incoming().strategyId)
+          && incoming().name is string && incoming().name.size() >= 1 && incoming().name.size() <= 100
+          && incoming().category in ['TREND', 'MEAN_REVERSION', 'MOMENTUM', 'ORDERFLOW', 'VOLATILITY']
+          && incoming().preferredRegimes is string && incoming().preferredRegimes.size() <= 180
+          && incoming().entryRule is string && incoming().entryRule.size() <= 400
+          && incoming().positionManagementGuide is string && incoming().positionManagementGuide.size() <= 400
+          && incoming().weight is number && incoming().weight >= 0.1 && incoming().weight <= 5.0
+          && incoming().wins is number && incoming().wins >= 0
+          && incoming().losses is number && incoming().losses >= 0
+          && incoming().totalPnlUsd is number
+          && incoming().enabled is bool
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time;
+        allow update: if isValidId(userId) && isValidId(strategyId) && isVerifiedUser() && isOwner(userId)
+          && incoming().keys().hasAll([
+            'ownerId', 'strategyId', 'name', 'category', 'preferredRegimes',
+            'entryRule', 'positionManagementGuide', 'weight', 'wins', 'losses',
+            'totalPnlUsd', 'enabled', 'createdAt', 'updatedAt'
+          ])
+          && incoming().keys().hasOnly([
+            'ownerId', 'strategyId', 'name', 'category', 'preferredRegimes',
+            'entryRule', 'positionManagementGuide', 'weight', 'wins', 'losses',
+            'totalPnlUsd', 'enabled', 'createdAt', 'updatedAt'
+          ])
+          && incoming().ownerId == existing().ownerId
+          && incoming().strategyId == existing().strategyId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && incoming().weight is number && incoming().weight >= 0.1 && incoming().weight <= 5.0
+          && incoming().wins is number && incoming().wins >= 0
+          && incoming().losses is number && incoming().losses >= 0
+          && incoming().totalPnlUsd is number
+          && incoming().enabled is bool
+          && incoming().diff(existing()).affectedKeys().hasOnly([
+            'weight', 'wins', 'losses', 'totalPnlUsd', 'enabled', 'updatedAt'
+          ]);
+        allow delete: if isValidId(userId) && isValidId(strategyId) && isVerifiedUser() && isOwner(userId);
       }
     }
   }

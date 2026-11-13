@@ -10,10 +10,12 @@ interface PositionsViewProps {
   masterWalletAddress: string;
   hasApiKey: boolean;
   executingCoin: string | null;
+  closingAll?: boolean;
   syncingAccount: boolean;
   lastSyncedAt: number | null;
   onRefreshAccount: () => void;
   onCloseLivePosition: (coin: string, side: 'LONG' | 'SHORT', size: number) => void;
+  onCloseAllPositions?: () => void;
   onClosePersistedPosition: (pos: PersistedPosition) => void;
   onOpenApiModal: () => void;
 }
@@ -25,10 +27,12 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
   masterWalletAddress,
   hasApiKey,
   executingCoin,
+  closingAll = false,
   syncingAccount,
   lastSyncedAt,
   onRefreshAccount,
   onCloseLivePosition,
+  onCloseAllPositions,
   onClosePersistedPosition,
   onOpenApiModal,
 }) => {
@@ -78,7 +82,7 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
                 : 'Conecta tu Master Address o API Wallet para sincronizar posiciones reales'}
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               disabled={syncingAccount}
               onClick={() => {
@@ -90,7 +94,24 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
               <RefreshCw className={`w-3.5 h-3.5 text-amber-400 ${syncingAccount ? 'animate-spin' : ''}`} />
               {syncingAccount ? 'Sincronizando...' : 'Actualizar Posiciones'}
             </button>
-            {!masterWalletAddress && (
+            {accountSummary && accountSummary.positions.length > 0 && onCloseAllPositions && (
+              <button
+                disabled={closingAll}
+                onClick={() => {
+                  soundEngine.click();
+                  onCloseAllPositions();
+                }}
+                className="px-3.5 py-2 rounded-md bg-red-600 hover:bg-red-500 disabled:opacity-50 text-white text-xs font-bold inline-flex items-center gap-1.5 transition-colors"
+              >
+                <XCircle className="w-3.5 h-3.5" />
+                {closingAll
+                  ? 'Cerrando Todas...'
+                  : hasApiKey
+                  ? `Cerrar Todas (${accountSummary.positions.length})`
+                  : 'Conectar Key y Cerrar Todas'}
+              </button>
+            )}
+            {(!masterWalletAddress || !hasApiKey) && (
               <button
                 onClick={() => {
                   soundEngine.click();
@@ -98,7 +119,7 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
                 }}
                 className="px-3 py-2 rounded-md bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold"
               >
-                Conectar Wallet
+                {!masterWalletAddress ? 'Conectar Wallet' : 'Ingresar Agent Key'}
               </button>
             )}
           </div>
@@ -155,15 +176,19 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
                       </td>
                       <td className="py-3 px-4 text-right">
                         <button
-                          disabled={!hasApiKey || executingCoin === pos.coin}
+                          disabled={executingCoin === pos.coin || closingAll}
                           onClick={() => {
                             soundEngine.click();
                             onCloseLivePosition(pos.coin, pos.side, Math.abs(pos.szi));
                           }}
-                          className="px-2.5 py-1 rounded bg-red-600/20 hover:bg-red-600 text-red-300 hover:text-white border border-red-500/40 disabled:opacity-40 text-[11px] font-sans font-medium inline-flex items-center gap-1"
+                          className="px-3 py-1.5 rounded bg-red-600/25 hover:bg-red-600 text-red-200 hover:text-white border border-red-500/50 disabled:opacity-40 text-[11px] font-sans font-semibold inline-flex items-center gap-1 transition-colors"
                         >
-                          <XCircle className="w-3 h-3" />
-                          {executingCoin === pos.coin ? 'Cerrando...' : 'Cerrar'}
+                          <XCircle className="w-3.5 h-3.5" />
+                          {executingCoin === pos.coin
+                            ? 'Cerrando...'
+                            : hasApiKey
+                            ? 'Cerrar'
+                            : 'Key + Cerrar'}
                         </button>
                       </td>
                     </tr>

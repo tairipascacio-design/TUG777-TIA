@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Wallet } from 'ethers';
 import { KeyRound, ShieldAlert, ShieldCheck, X } from 'lucide-react';
 import type { BotConfigData, HlNetwork } from '../types/trading';
@@ -13,6 +13,7 @@ interface ApiWalletModalProps {
     network: HlNetwork;
     masterWalletAddress: string;
     apiPrivateKey: string;
+    rememberKey: boolean;
     mevShieldEnabled: boolean;
     maxSlippageBps: number;
     maxOracleDeviationBps: number;
@@ -30,10 +31,25 @@ export const ApiWalletModal: React.FC<ApiWalletModalProps> = ({
   const [network, setNetwork] = useState<HlNetwork>(config.network);
   const [masterWallet, setMasterWallet] = useState(config.masterWalletAddress);
   const [privKey, setPrivKey] = useState(apiPrivateKey);
+  const [rememberKey, setRememberKey] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true;
+    return localStorage.getItem('tug777_remember_pk') !== 'false';
+  });
   const [mevShield, setMevShield] = useState(config.mevShieldEnabled);
   const [maxSlippageBps, setMaxSlippageBps] = useState(String(config.maxSlippageBps));
   const [maxOracleBps, setMaxOracleBps] = useState(String(config.maxOracleDeviationBps));
   const [riskUsd, setRiskUsd] = useState(String(config.riskPerTradeUsd));
+
+  useEffect(() => {
+    if (!open) return;
+    setNetwork(config.network);
+    setMasterWallet(config.masterWalletAddress);
+    setPrivKey(apiPrivateKey);
+    setMevShield(config.mevShieldEnabled);
+    setMaxSlippageBps(String(config.maxSlippageBps));
+    setMaxOracleBps(String(config.maxOracleDeviationBps));
+    setRiskUsd(String(config.riskPerTradeUsd));
+  }, [open, config, apiPrivateKey]);
 
   const derivedAgentAddress = useMemo(() => {
     const trimmed = privKey.trim();
@@ -57,10 +73,11 @@ export const ApiWalletModal: React.FC<ApiWalletModalProps> = ({
       network,
       masterWalletAddress: masterWallet.trim(),
       apiPrivateKey: normalizedKey,
+      rememberKey,
       mevShieldEnabled: mevShield,
       maxSlippageBps: Math.max(5, Math.min(300, Number(maxSlippageBps || 25))),
       maxOracleDeviationBps: Math.max(5, Math.min(300, Number(maxOracleBps || 45))),
-      riskPerTradeUsd: Math.max(10, Math.min(100000, Number(riskUsd || 50))),
+      riskPerTradeUsd: Math.max(10, Math.min(1000000, Number(riskUsd || 50))),
     });
     onClose();
   };
@@ -161,9 +178,17 @@ export const ApiWalletModal: React.FC<ApiWalletModalProps> = ({
                 <span>Agent Address derivada: {derivedAgentAddress}</span>
               </div>
             )}
-            <p className="mt-1 text-[11px] text-slate-500">
-              Se conserva únicamente en tu navegador (`sessionStorage`) para firmar órdenes L1; nunca se envía a Firestore.
-            </p>
+            <label className="mt-2.5 flex items-start gap-2 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={rememberKey}
+                onChange={(e) => setRememberKey(e.target.checked)}
+                className="mt-0.5 accent-amber-500 rounded"
+              />
+              <span className="text-[11px] text-slate-300 leading-snug">
+                Recordar Agent Private Key en este dispositivo (`localStorage`) para cerrar y operar con 1 toque sin volver a pegarla tras recargar o abrir el APK. Nunca se envía a Firestore ni puede retirar fondos.
+              </span>
+            </label>
           </div>
 
           {/* Risk & Anti-MEV Flashbots Shield */}

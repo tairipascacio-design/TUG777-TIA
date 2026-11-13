@@ -112,6 +112,22 @@
         "useSearchGrounding": {
           "type": "boolean"
         },
+        "sizingMode": {
+          "type": "string",
+          "enum": ["equity_pct", "fixed_usd"]
+        },
+        "capitalPctPerTrade": {
+          "type": "number"
+        },
+        "maxOpenPositions": {
+          "type": "number"
+        },
+        "trailingStopEnabled": {
+          "type": "boolean"
+        },
+        "autoManagePositions": {
+          "type": "boolean"
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time"
@@ -189,6 +205,10 @@
         "thesis": {
           "type": "string",
           "maxLength": 600
+        },
+        "strategyTag": {
+          "type": "string",
+          "maxLength": 160
         },
         "createdAt": {
           "type": "string",
@@ -320,6 +340,83 @@
         }
       },
       "required": ["ownerId", "role", "content", "modelUsed", "createdAt"]
+    },
+    "StrategyPlaybook": {
+      "title": "StrategyPlaybook",
+      "description": "Adaptive institutional strategy & position management guide learned across live Hyperliquid trades.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "strategyId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "category": {
+          "type": "string",
+          "enum": ["TREND", "MEAN_REVERSION", "MOMENTUM", "ORDERFLOW", "VOLATILITY"]
+        },
+        "preferredRegimes": {
+          "type": "string",
+          "maxLength": 180
+        },
+        "entryRule": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "positionManagementGuide": {
+          "type": "string",
+          "maxLength": 400
+        },
+        "weight": {
+          "type": "number"
+        },
+        "wins": {
+          "type": "number"
+        },
+        "losses": {
+          "type": "number"
+        },
+        "totalPnlUsd": {
+          "type": "number"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "ownerId",
+        "strategyId",
+        "name",
+        "category",
+        "preferredRegimes",
+        "entryRule",
+        "positionManagementGuide",
+        "weight",
+        "wins",
+        "losses",
+        "totalPnlUsd",
+        "enabled",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -346,6 +443,10 @@
     "/users/{userId}/chat_messages/{messageId}": {
       "schema": { "$ref": "#/entities/ChatMessage" },
       "description": "Persistent AI Trading Copilot chat thread."
+    },
+    "/users/{userId}/strategy_playbook/{strategyId}": {
+      "schema": { "$ref": "#/entities/StrategyPlaybook" },
+      "description": "Unified multi-strategy adaptive weights, win/loss stats, and position management guide."
     }
   }
 }

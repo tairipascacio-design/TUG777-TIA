@@ -91,11 +91,62 @@ async function callCustomOpenAiCompatible(params: {
   };
 }
 
+export interface DeepAnalysisPayload {
+  coin: string;
+  markPx: number;
+  regime: string;
+  direction: 'LONG' | 'SHORT' | 'NEUTRAL';
+  unifiedScore: number;
+  confidence: number;
+  firedStrategies: string[];
+  rsi14: number;
+  atrPct: number;
+  vwapDistPct: number;
+  bbWidthPct: number;
+  l2Imbalance: number;
+  spreadBps: number;
+  recommendedSlPct: number;
+  recommendedTpPct: number;
+  antiChaseBlocked: boolean;
+  reasons: string[];
+}
+
+export interface PlaybookSummaryItem {
+  strategyId: string;
+  name: string;
+  category: string;
+  preferredRegimes: string;
+  weight: number;
+  wins: number;
+  losses: number;
+  totalPnlUsd: number;
+  enabled: boolean;
+}
+
 export async function analyzeMarketWithBrain(params: {
   mode: 'strategy' | 'ai' | 'strategy_ai';
   candidates: MarketCandidate[];
+  deepAnalyses?: DeepAnalysisPayload[];
+  playbook?: PlaybookSummaryItem[];
+  positionGuide?: string[];
+  fillsSummary?: {
+    totalClosed: number;
+    winRatePct: number;
+    netPnlUsd: number;
+    totalFeesUsd: number;
+    losingCoins: Array<{ coin: string; pnl: number }>;
+    winningCoins: Array<{ coin: string; pnl: number }>;
+    recentClosed: Array<{ coin: string; pnl: number; time: number }>;
+  };
   memories: LearnedMemoryItem[];
-  openPositions: Array<{ coin: string; side: string; size: number; unrealizedPnl: number }>;
+  openPositions: Array<{
+    coin: string;
+    side: string;
+    size?: number;
+    entryPx?: number;
+    unrealizedPnl: number;
+    returnOnEquity?: number;
+  }>;
   macroBrief?: string;
   deepThinking?: boolean;
   aiProvider?: 'gemini' | 'custom_ai';
@@ -108,20 +159,35 @@ export async function analyzeMarketWithBrain(params: {
   const baseSystemPrompt =
     params.customSystemPrompt?.trim() ||
     `Eres el Cerebro Unificado de Trading Institucional de TUG777 HyperTrade para Hyperliquid Perps.
-Tu única misión es preservar el capital y capturar setups de alta probabilidad asimétrica usando datos reales del mercado en vivo y la memoria histórica de trades en Firestore.
-REGLAS ESTRICTAS:
-1. Analiza la confluencia: Orderflow, Momentum 24h, Funding Rate anualizado, Open Interest y Divergencia Mark/Oracle.
-2. Si existen lecciones previas en la memoria de Firestore para un token o régimen similar con LOSS, penaliza o veta esa entrada salvo confluencia extrema.
-3. Si no hay setup claro, devuelve action = "HOLD". Nunca inventes precios. Responde en español técnico conciso.`;
+Tu misión es HACER CRECER EL CAPITAL con precisión quirúrgica (Ratio Riesgo/Beneficio mínimo 1:2.1) evitando sobre-operar y operando SIEMPRE A FAVOR DE LA ESTRUCTURA REAL.
+REGLAS OBLIGATORIAS:
+1. PROHIBIDO OPERAR EN CONTRA DE LA TENDENCIA: Nunca abras SHORT cuando el régimen es TRENDING_BULL o la dirección en deepAnalyses es LONG/NEUTRAL por sobreextensión. Nunca abras LONG cuando el régimen es TRENDING_BEAR o atrapando cuchillos cayendo. Si BTC está cayendo fuerte, exige confluencia extrema (>=80) para cualquier LONG.
+2. CRUZA LA BASE DE DATOS: Revisa "strategyPlaybook" (pesos aprendidos, wins/losses reales), "learnedMemories" (lecciones de Firestore) y "hyperliquidFillsHistory" (historial real de fills, comisiones y tokens perdedores).
+3. GESTIÓN DE POSICIONES ABIERTAS: Revisa "openPositions" contra "positionManagementGuide". Si una posición abierta va en contra de la estructura 15M+1H actual, muestra invalidación de régimen o conviene asegurar ganancia, devuelve action = "CLOSE" sobre ese coin.
+4. ENTRADAS DE ALTA PROBABILIDAD: Solo abre LONG o SHORT cuando un candidato en "deepAnalyses" tiene direction igual a tu acción ("LONG" o "SHORT"), antiChaseBlocked == false, mínimo 2 estrategias alineadas y score >= 60. Penaliza tokens en "losingCoins".
+5. EVITA FALSAS ENTRADAS: Si ningún setup tiene dirección clara y ventaja matemática real, devuelve action = "HOLD". Nunca inventes precios. Responde en español técnico conciso.`;
 
   const promptPayload = {
     mode: params.mode,
     targetTpPct: params.tpPct ?? 3.0,
     targetSlPct: params.slPct ?? 1.4,
+    positionManagementGuide: params.positionGuide || [],
     openPositions: params.openPositions,
-    learnedMemories: params.memories.slice(0, 12),
+    strategyPlaybook: (params.playbook || []).map((p) => ({
+      id: p.strategyId,
+      name: p.name,
+      regimes: p.preferredRegimes,
+      weight: p.weight,
+      wins: p.wins,
+      losses: p.losses,
+      pnl: p.totalPnlUsd,
+      enabled: p.enabled,
+    })),
+    hyperliquidFillsHistory: params.fillsSummary || null,
+    learnedMemories: params.memories.slice(0, 15),
     macroContext: params.macroBrief || 'Sin briefing macro adicional.',
-    topCandidates: params.candidates.slice(0, 10),
+    deepAnalyses: (params.deepAnalyses || []).slice(0, 8),
+    topCandidatesFallback: params.candidates.slice(0, 6),
   };
 
   // Route to user's own AI endpoint (Ollama / DeepSeek / OpenAI-compatible) if selected
@@ -129,7 +195,7 @@ REGLAS ESTRICTAS:
     const customRes = await callCustomOpenAiCompatible({
       endpointUrl: params.customAiUrl || '',
       model: params.customAiModel || '',
-      systemPrompt: `${baseSystemPrompt}\nDevuelve ÚNICAMENTE un JSON válido con claves: action ("LONG"|"SHORT"|"CLOSE"|"HOLD"), coin (string), confidence (number 0-100), regime (string), reason (string), tpPct (number), slPct (number).`,
+      systemPrompt: `${baseSystemPrompt}\nDevuelve ÚNICAMENTE un JSON válido con claves: action ("LONG"|"SHORT"|"CLOSE"|"HOLD"), coin (string), confidence (number 0-100), regime (string), reason (string), tpPct (number), slPct (number), strategiesUsed (string[]).`,
       userContent: JSON.stringify(promptPayload),
       expectJson: true,
     });
@@ -153,9 +219,14 @@ REGLAS ESTRICTAS:
         coin: { type: Type.STRING, description: 'Ticker exacto de Hyperliquid o NONE' },
         confidence: { type: Type.NUMBER, description: 'Confianza de 0 a 100' },
         regime: { type: Type.STRING, description: 'Regimen de mercado detectado' },
-        reason: { type: Type.STRING, description: 'Tesis tecnica y de memoria en maximo 220 caracteres' },
+        reason: { type: Type.STRING, description: 'Tesis tecnica, de gestion y memoria en maximo 240 caracteres' },
         tpPct: { type: Type.NUMBER, description: 'Take Profit sugerido en %' },
         slPct: { type: Type.NUMBER, description: 'Stop Loss sugerido en %' },
+        strategiesUsed: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING },
+          description: 'IDs de estrategias del playbook usadas',
+        },
       },
       required: ['action', 'coin', 'confidence', 'regime', 'reason', 'tpPct', 'slPct'],
     },
@@ -177,18 +248,38 @@ REGLAS ESTRICTAS:
     return { ...parsed, modelUsed: model };
   } catch (err) {
     if (isQuotaError(err)) {
-      // Automatic fallback to deterministic Pro Master Quant Engine so trading never halts on 429
+      // Automatic fallback to deterministic Unified 10-Strategy Deep Engine on 429
+      const bestDeep = (params.deepAnalyses || [])
+        .filter((d) => d.direction !== 'NEUTRAL' && !d.antiChaseBlocked)
+        .sort((a, b) => b.unifiedScore - a.unifiedScore)[0];
+
+      if (bestDeep && bestDeep.unifiedScore >= 60) {
+        return {
+          action: bestDeep.direction,
+          coin: bestDeep.coin,
+          confidence: bestDeep.confidence,
+          regime: `${bestDeep.regime} (Fallback Multi-Estrategia 429)`,
+          reason: `${bestDeep.firedStrategies.join(' + ')}: ${bestDeep.reasons.slice(0, 2).join(' · ')}`,
+          tpPct: bestDeep.recommendedTpPct || params.tpPct || 3.0,
+          slPct: bestDeep.recommendedSlPct || params.slPct || 1.4,
+          strategiesUsed: bestDeep.firedStrategies,
+          modelUsed: '10-Strategy Quant Fallback (429)',
+          quotaExceeded: true,
+        };
+      }
+
       const top = params.candidates.find((c) => c.quantBias !== 'NEUTRAL');
       return {
-        action: top && top.quantScore >= 60 ? top.quantBias : 'HOLD',
+        action: 'HOLD',
         coin: top?.coin || 'NONE',
-        confidence: top?.quantScore || 40,
-        regime: 'Fallback Cuantitativo (Cuota Gemini 429)',
+        confidence: bestDeep?.confidence || 42,
+        regime: 'Espera Segura (Cuota Gemini 429)',
         reason:
-          'Cuota gratuita de Gemini alcanzada (429). Configura facturación en Settings > Secrets o usa tu IA Externa en Parámetros IA.',
+          'Sin confluencia multi-estrategia suficiente en modo fallback. Configura facturación o tu IA Externa en Parámetros IA.',
         tpPct: params.tpPct ?? 3.0,
         slPct: params.slPct ?? 1.4,
-        modelUsed: 'Quant Fallback (429)',
+        strategiesUsed: [],
+        modelUsed: '10-Strategy Quant Fallback (429)',
         quotaExceeded: true,
       };
     }

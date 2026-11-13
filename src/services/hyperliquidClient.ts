@@ -10,29 +10,103 @@ import type {
   MevProbeStatus,
 } from '../types/trading';
 
+const HL_DIRECT_BASE: Record<HlNetwork, string> = {
+  mainnet: 'https://api.hyperliquid.xyz',
+  testnet: 'https://api.hyperliquid-testnet.xyz',
+};
+
+async function parseJsonSafe<T = unknown>(res: Response): Promise<T> {
+  const text = await res.text();
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.startsWith('<')) {
+    throw new Error(`Respuesta HTML/no-JSON del proxy (${res.status})`);
+  }
+  return JSON.parse(trimmed) as T;
+}
+
 export async function hlInfoRequest<T = unknown>(
   network: HlNetwork,
   payload: Record<string, unknown>
 ): Promise<{ data: T; latencyMs: number; channel: string }> {
-  const res = await fetch('/api/hl/info', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ network, payload }),
-  });
-  const json = await res.json();
-  if (!res.ok) {
-    throw new Error(json?.error || `Hyperliquid HTTP ${res.status}`);
+  try {
+    const res = await fetch('/api/hl/info', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ network, payload }),
+    });
+    const json = await parseJsonSafe<{ data: T; latencyMs: number; channel: string; error?: string }>(res);
+    if (!res.ok) {
+      throw new Error(json?.error || `Hyperliquid HTTP ${res.status}`);
+    }
+    return json;
+  } catch {
+    // Direct Hyperliquid L1 fallback (Hyperliquid /info supports CORS Access-Control-Allow-Origin: *)
+    const t0 = performance.now();
+    const directRes = await fetch(`${HL_DIRECT_BASE[network]}/info`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!directRes.ok) {
+      const errText = await directRes.text();
+      throw new Error(`Hyperliquid Direct HTTP ${directRes.status}: ${errText.slice(0, 200)}`);
+    }
+    const data = await parseJsonSafe<T>(directRes);
+    return {
+      data,
+      latencyMs: Math.round(performance.now() - t0),
+      channel: 'HL-DIRECT-L1',
+    };
   }
-  return json;
 }
 
 export async function fetchMevAndLatencyProbe(network: HlNetwork): Promise<MevProbeStatus> {
-  const res = await fetch(`/api/mev/probe?network=${network}`);
-  const json = await res.json();
-  if (!res.ok) {
-    throw new Error(json?.error || 'Error verificando canales RPC');
+  try {
+    const res = await fetch(`/api/mev/probe?network=${network}`, {
+      headers: { Accept: 'application/json' },
+    });
+    const json = await parseJsonSafe<MevProbeStatus & { error?: string }>(res);
+    if (!res.ok) {
+      throw new Error(json?.error || 'Error verificando canales RPC');
+    }
+    return json;
+  } catch {
+    const hlBase = HL_DIRECT_BASE[network];
+    const probeDirect = async (name: string, url: string, body: unknown) => {
+      const t0 = performance.now();
+      try {
+        const r = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const rtt = Math.round(performance.now() - t0);
+        if (!r.ok) return { name, ok: false, latencyMs: rtt, detail: `HTTP ${r.status}` };
+        const json = await parseJsonSafe<{ result?: string }>(r);
+        return { name, ok: true, latencyMs: rtt, detail: json?.result || 'OK' };
+      } catch (e) {
+        return { name, ok: false, latencyMs: Math.round(performance.now() - t0), detail: String(e) };
+      }
+    };
+
+    const [hl1, hl2, flashbots] = await Promise.all([
+      probeDirect('Hyperliquid L1 Primary', `${hlBase}/info`, { type: 'meta' }),
+      probeDirect('Hyperliquid L1 Backup Pool', `${hlBase}/info`, { type: 'allMids' }),
+      probeDirect('Flashbots Protect RPC', 'https://rpc.flashbots.net', {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_blockNumber',
+        params: [],
+      }),
+    ]);
+
+    return {
+      channels: [hl1, hl2, flashbots],
+      bestHlLatencyMs: Math.min(hl1.latencyMs, hl2.latencyMs),
+      flashbotsBlockHex: flashbots.ok ? String(flashbots.detail) : null,
+      checkedAt: Date.now(),
+    };
   }
-  return json;
 }
 
 export function computeQuantConfluence(raw: {
@@ -55,28 +129,28 @@ export function computeQuantConfluence(raw: {
     bearPts += 12;
   }
 
-  // 2. Momentum Confluence
-  if (raw.change24hPct >= 2.2 && raw.change24hPct <= 14) {
+  // 2. Momentum Confluence (Trend-following, never flip extended trends into contrarian fades)
+  if (raw.change24hPct >= 2.0 && raw.change24hPct <= 14) {
     signals.push(`Momentum alcista +${raw.change24hPct.toFixed(1)}%`);
     bullPts += 28;
-  } else if (raw.change24hPct <= -2.2 && raw.change24hPct >= -14) {
+  } else if (raw.change24hPct <= -2.0 && raw.change24hPct >= -14) {
     signals.push(`Momentum bajista ${raw.change24hPct.toFixed(1)}%`);
     bearPts += 28;
   } else if (raw.change24hPct > 18) {
-    signals.push('Sobreextensión alcista');
-    bearPts += 20;
+    signals.push(`Tendencia fuerte extendida (+${raw.change24hPct.toFixed(1)}%)`);
+    bullPts += 10;
   } else if (raw.change24hPct < -18) {
-    signals.push('Capitulación extrema');
-    bullPts += 20;
+    signals.push(`Tendencia bajista extendida (${raw.change24hPct.toFixed(1)}%)`);
+    bearPts += 10;
   }
 
-  // 3. Funding Rate Squeeze / Carry Edge
+  // 3. Funding Rate Carry / Positioning Alignment
   if (raw.annualizedFundingPct <= -25) {
     signals.push(`Short Squeeze Funding (${raw.annualizedFundingPct.toFixed(0)}% APR)`);
-    bullPts += 26;
-  } else if (raw.annualizedFundingPct >= 45) {
-    signals.push(`Long Crowding (${raw.annualizedFundingPct.toFixed(0)}% APR)`);
-    bearPts += 26;
+    bullPts += 18;
+  } else if (raw.annualizedFundingPct >= 65) {
+    signals.push(`Funding muy cargado (${raw.annualizedFundingPct.toFixed(0)}% APR)`);
+    bearPts += 12;
   }
 
   // 4. Mark vs Oracle Basis
@@ -207,18 +281,20 @@ export async function fetchCandles(
     req: { coin, interval, startTime, endTime },
   });
 
-  return (data || []).map((k) => ({
-    t: k.t,
-    T: k.T,
-    s: k.s,
-    i: k.i,
-    o: Number(k.o),
-    c: Number(k.c),
-    h: Number(k.h),
-    l: Number(k.l),
-    v: Number(k.v),
-    n: k.n,
-  }));
+  return (data || [])
+    .map((k) => ({
+      t: k.t,
+      T: k.T,
+      s: k.s,
+      i: k.i,
+      o: Number(k.o),
+      c: Number(k.c),
+      h: Number(k.h),
+      l: Number(k.l),
+      v: Number(k.v),
+      n: k.n,
+    }))
+    .sort((a, b) => a.t - b.t);
 }
 
 export async function fetchL2Book(
@@ -360,11 +436,12 @@ export function formatHlPrice(price: number, szDecimals: number): string {
   return fixed.replace(/\.?0+$/, '');
 }
 
-export function formatHlSize(size: number, szDecimals: number): string {
+export function formatHlSize(size: number, szDecimals: number, isReduceOnly = false): string {
   if (!Number.isFinite(size) || size <= 0) return '0';
   const factor = Math.pow(10, szDecimals);
-  const floored = Math.floor(size * factor) / factor;
-  return floored.toFixed(szDecimals).replace(/\.?0+$/, '') || '0';
+  const scaled = isReduceOnly ? Math.round(size * factor) : Math.floor((size + 1e-12) * factor);
+  const rounded = scaled / factor;
+  return rounded.toFixed(szDecimals).replace(/\.?0+$/, '') || '0';
 }
 
 // Anti-MEV / Flashbots Guard Verification before any order submission
@@ -440,9 +517,11 @@ export async function executeRealHyperliquidOrder(params: {
   reduceOnly?: boolean;
 }) {
   const wallet = new Wallet(params.apiPrivateKey.trim());
-  const slipFactor = params.isBuy ? 1 + params.slippageBps / 10000 : 1 - params.slippageBps / 10000;
+  const slipFactor = params.isBuy
+    ? 1 + params.slippageBps / 10000
+    : Math.max(0.05, 1 - params.slippageBps / 10000);
   const limitPxStr = formatHlPrice(params.referencePx * slipFactor, params.szDecimals);
-  const sizeStr = formatHlSize(params.sizeCoins, params.szDecimals);
+  const sizeStr = formatHlSize(params.sizeCoins, params.szDecimals, Boolean(params.reduceOnly));
 
   if (Number(sizeStr) <= 0) {
     throw new Error('Tamaño de orden demasiado pequeño tras redondeo de decimales Hyperliquid.');
@@ -501,26 +580,51 @@ export async function executeRealHyperliquidOrder(params: {
     },
   };
 
-  const res = await fetch('/api/hl/exchange', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      network: params.network,
-      signedPayload,
-    }),
-  });
+  try {
+    const res = await fetch('/api/hl/exchange', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({
+        network: params.network,
+        signedPayload,
+      }),
+    });
 
-  const json = await res.json();
-  if (!res.ok) {
-    throw new Error(json?.error || 'Error enviando orden firmada a Hyperliquid');
+    const json = await parseJsonSafe<{ data: unknown; latencyMs: number; channel: string; error?: string }>(res);
+    if (!res.ok) {
+      throw new Error(json?.error || 'Error enviando orden firmada a Hyperliquid');
+    }
+
+    return {
+      exchangeResponse: json.data,
+      latencyMs: json.latencyMs,
+      channel: json.channel,
+      agentAddress: wallet.address,
+      limitPxStr,
+      sizeStr,
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (!msg.includes('HTML/no-JSON') && !msg.includes('Failed to fetch')) {
+      throw err;
+    }
+    const t0 = performance.now();
+    const directRes = await fetch(`${HL_DIRECT_BASE[params.network]}/exchange`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(signedPayload),
+    });
+    const data = await parseJsonSafe(directRes);
+    if (!directRes.ok) {
+      throw new Error('Error enviando orden firmada directamente a Hyperliquid');
+    }
+    return {
+      exchangeResponse: data,
+      latencyMs: Math.round(performance.now() - t0),
+      channel: 'HL-DIRECT-L1',
+      agentAddress: wallet.address,
+      limitPxStr,
+      sizeStr,
+    };
   }
-
-  return {
-    exchangeResponse: json.data,
-    latencyMs: json.latencyMs as number,
-    channel: json.channel as string,
-    agentAddress: wallet.address,
-    limitPxStr,
-    sizeStr,
-  };
 }

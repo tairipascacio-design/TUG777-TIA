@@ -187,6 +187,17 @@ app.post('/api/ai/chat', async (req, res) => {
 async function startServer() {
   const PORT = 3000;
 
+  app.get('/TUG777-HyperTrade.apk', (_req, res) => {
+    const apkPath = path.join(__dirname, 'public', 'TUG777-HyperTrade.apk');
+    res.setHeader('Content-Type', 'application/vnd.android.package-archive');
+    res.setHeader('Content-Disposition', 'attachment; filename="TUG777-HyperTrade.apk"');
+    res.sendFile(apkPath);
+  });
+
+  app.use('/api', (_req, res) => {
+    res.status(404).json({ error: 'API route not found' });
+  });
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -197,7 +208,7 @@ async function startServer() {
   } else {
     const distPath = path.join(__dirname, 'dist');
     app.use(express.static(distPath));
-    app.get('/{*splat}', (_req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

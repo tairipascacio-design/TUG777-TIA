@@ -128,6 +128,47 @@
         "autoManagePositions": {
           "type": "boolean"
         },
+        "riskPerTradePct": {
+          "type": "number"
+        },
+        "dailyMaxLossPct": {
+          "type": "number"
+        },
+        "killSwitchEnabled": {
+          "type": "boolean"
+        },
+        "geminiModel": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "globalBiasLock": {
+          "type": "string",
+          "enum": ["AMBOS", "SOLO_LONG", "SOLO_SHORT", "PAUSA"]
+        },
+        "pairBiasLocksJson": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "useAloEntries": {
+          "type": "boolean"
+        },
+        "minOrderUsdFloor": {
+          "type": "number"
+        },
+        "streakCooldownHours": {
+          "type": "number"
+        },
+        "watchlistCoinsCsv": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "mcloudEnabled": {
+          "type": "boolean"
+        },
+        "mcloudUrl": {
+          "type": "string",
+          "maxLength": 256
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time"
@@ -209,6 +250,13 @@
         "strategyTag": {
           "type": "string",
           "maxLength": 160
+        },
+        "cloid": {
+          "type": "string",
+          "maxLength": 72
+        },
+        "isExternal": {
+          "type": "boolean"
         },
         "createdAt": {
           "type": "string",

@@ -54,7 +54,11 @@ service cloud.firestore {
           'minConfidence', 'minQuantScore', 'minVolumeM', 'tpPct', 'slPct',
           'useDeepThinking', 'useSearchGrounding', 'sizingMode',
           'capitalPctPerTrade', 'maxOpenPositions', 'trailingStopEnabled',
-          'autoManagePositions', 'createdAt', 'updatedAt'
+          'autoManagePositions', 'riskPerTradePct', 'dailyMaxLossPct',
+          'killSwitchEnabled', 'geminiModel', 'globalBiasLock',
+          'pairBiasLocksJson', 'useAloEntries', 'minOrderUsdFloor',
+          'streakCooldownHours', 'watchlistCoinsCsv', 'mcloudEnabled',
+          'mcloudUrl', 'createdAt', 'updatedAt'
         ])
         && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
         && data.mode in ['strategy', 'ai', 'strategy_ai']
@@ -70,12 +74,12 @@ service cloud.firestore {
         && (!('customAiUrl' in data) || (data.customAiUrl is string && data.customAiUrl.size() <= 256))
         && (!('customAiModel' in data) || (data.customAiModel is string && data.customAiModel.size() <= 120))
         && (!('customSystemPrompt' in data) || (data.customSystemPrompt is string && data.customSystemPrompt.size() <= 1500))
-        && (!('scanIntervalSec' in data) || (data.scanIntervalSec is number && data.scanIntervalSec >= 30 && data.scanIntervalSec <= 3600))
-        && (!('minConfidence' in data) || (data.minConfidence is number && data.minConfidence >= 40 && data.minConfidence <= 99))
+        && (!('scanIntervalSec' in data) || (data.scanIntervalSec is number && data.scanIntervalSec >= 15 && data.scanIntervalSec <= 3600))
+        && (!('minConfidence' in data) || (data.minConfidence is number && data.minConfidence >= 35 && data.minConfidence <= 99))
         && (!('minQuantScore' in data) || (data.minQuantScore is number && data.minQuantScore >= 20 && data.minQuantScore <= 95))
         && (!('minVolumeM' in data) || (data.minVolumeM is number && data.minVolumeM >= 0.1 && data.minVolumeM <= 500))
-        && (!('tpPct' in data) || (data.tpPct is number && data.tpPct >= 0.2 && data.tpPct <= 100))
-        && (!('slPct' in data) || (data.slPct is number && data.slPct >= 0.2 && data.slPct <= 50))
+        && (!('tpPct' in data) || (data.tpPct is number && data.tpPct >= 0.2 && data.tpPct <= 200))
+        && (!('slPct' in data) || (data.slPct is number && data.slPct >= 0.05 && data.slPct <= 50))
         && (!('useDeepThinking' in data) || data.useDeepThinking is bool)
         && (!('useSearchGrounding' in data) || data.useSearchGrounding is bool)
         && (!('sizingMode' in data) || data.sizingMode in ['equity_pct', 'fixed_usd'])
@@ -83,6 +87,18 @@ service cloud.firestore {
         && (!('maxOpenPositions' in data) || (data.maxOpenPositions is number && data.maxOpenPositions >= 1 && data.maxOpenPositions <= 20))
         && (!('trailingStopEnabled' in data) || data.trailingStopEnabled is bool)
         && (!('autoManagePositions' in data) || data.autoManagePositions is bool)
+        && (!('riskPerTradePct' in data) || (data.riskPerTradePct is number && data.riskPerTradePct >= 0.05 && data.riskPerTradePct <= 25))
+        && (!('dailyMaxLossPct' in data) || (data.dailyMaxLossPct is number && data.dailyMaxLossPct >= 0.1 && data.dailyMaxLossPct <= 100))
+        && (!('killSwitchEnabled' in data) || data.killSwitchEnabled is bool)
+        && (!('geminiModel' in data) || (data.geminiModel is string && data.geminiModel.size() <= 120))
+        && (!('globalBiasLock' in data) || data.globalBiasLock in ['AMBOS', 'SOLO_LONG', 'SOLO_SHORT', 'PAUSA'])
+        && (!('pairBiasLocksJson' in data) || (data.pairBiasLocksJson is string && data.pairBiasLocksJson.size() <= 1000))
+        && (!('useAloEntries' in data) || data.useAloEntries is bool)
+        && (!('minOrderUsdFloor' in data) || (data.minOrderUsdFloor is number && data.minOrderUsdFloor >= 0 && data.minOrderUsdFloor <= 1000))
+        && (!('streakCooldownHours' in data) || (data.streakCooldownHours is number && data.streakCooldownHours >= 0.5 && data.streakCooldownHours <= 72))
+        && (!('watchlistCoinsCsv' in data) || (data.watchlistCoinsCsv is string && data.watchlistCoinsCsv.size() <= 500))
+        && (!('mcloudEnabled' in data) || data.mcloudEnabled is bool)
+        && (!('mcloudUrl' in data) || (data.mcloudUrl is string && data.mcloudUrl.size() <= 256))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -96,7 +112,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'ownerId', 'coin', 'side', 'size', 'entryPx', 'markPx', 'leverage',
           'unrealizedPnl', 'realizedPnl', 'status', 'mode', 'hlOrderId', 'thesis',
-          'strategyTag', 'createdAt', 'updatedAt'
+          'strategyTag', 'cloid', 'isExternal', 'createdAt', 'updatedAt'
         ])
         && data.ownerId is string && data.ownerId == userId && isValidId(data.ownerId)
         && data.coin is string && data.coin.size() >= 1 && data.coin.size() <= 32
@@ -112,6 +128,8 @@ service cloud.firestore {
         && data.hlOrderId is string && data.hlOrderId.size() <= 128
         && data.thesis is string && data.thesis.size() <= 600
         && (!('strategyTag' in data) || (data.strategyTag is string && data.strategyTag.size() <= 160))
+        && (!('cloid' in data) || (data.cloid is string && data.cloid.size() <= 72))
+        && (!('isExternal' in data) || data.isExternal is bool)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -184,7 +202,11 @@ service cloud.firestore {
             'minConfidence', 'minQuantScore', 'minVolumeM', 'tpPct', 'slPct',
             'useDeepThinking', 'useSearchGrounding', 'sizingMode',
             'capitalPctPerTrade', 'maxOpenPositions', 'trailingStopEnabled',
-            'autoManagePositions', 'updatedAt'
+            'autoManagePositions', 'riskPerTradePct', 'dailyMaxLossPct',
+            'killSwitchEnabled', 'geminiModel', 'globalBiasLock',
+            'pairBiasLocksJson', 'useAloEntries', 'minOrderUsdFloor',
+            'streakCooldownHours', 'watchlistCoinsCsv', 'mcloudEnabled',
+            'mcloudUrl', 'updatedAt'
           ]);
       }
 

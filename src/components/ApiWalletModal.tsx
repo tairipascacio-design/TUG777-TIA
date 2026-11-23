@@ -75,8 +75,8 @@ export const ApiWalletModal: React.FC<ApiWalletModalProps> = ({
       apiPrivateKey: normalizedKey,
       rememberKey,
       mevShieldEnabled: mevShield,
-      maxSlippageBps: Math.max(5, Math.min(300, Number(maxSlippageBps || 25))),
-      maxOracleDeviationBps: Math.max(5, Math.min(300, Number(maxOracleBps || 45))),
+      maxSlippageBps: Math.max(5, Math.min(300, Number(maxSlippageBps || 15))),
+      maxOracleDeviationBps: Math.max(5, Math.min(300, Number(maxOracleBps || 35))),
       riskPerTradeUsd: Math.max(10, Math.min(1000000, Number(riskUsd || 50))),
     });
     onClose();
@@ -191,15 +191,15 @@ export const ApiWalletModal: React.FC<ApiWalletModalProps> = ({
             </label>
           </div>
 
-          {/* Risk & Anti-MEV Flashbots Shield */}
+          {/* Risk & Anti-Sandwich / Slippage Guard */}
           <div className="pt-2 border-t border-slate-800/80 space-y-3">
             <div className="flex items-center justify-between">
               <div>
                 <span className="text-xs font-semibold text-slate-200">
-                  Seguro Anti-Flashbots / Mempool & Slippage Guard
+                  Escudo Anti-Sandwich / Mempool &amp; Slippage Guard
                 </span>
                 <p className="text-[11px] text-slate-400">
-                  Bloquea órdenes IOC si el spread, liquidez L2 o desviación Oracle superan tu límite.
+                  Bloquea órdenes si el spread, liquidez L2 o desviación Oracle superan tu límite (IOC 1.0–1.5%).
                 </p>
               </div>
               <button

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Check, Copy, Download, Server, Smartphone } from 'lucide-react';
+import { Check, Cloud, Copy, Download, Smartphone } from 'lucide-react';
 import { downloadAndroidApkKit } from '../utils/apkPackager';
 import { soundEngine } from '../utils/soundEngine';
 
@@ -15,7 +15,7 @@ export const DropletDeployView: React.FC<DropletDeployViewProps> = ({
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [downloadingApk, setDownloadingApk] = useState(false);
 
-  const originUrl = typeof window !== 'undefined' ? window.location.origin : 'https://tu-dominio.com';
+  const originUrl = typeof window !== 'undefined' ? window.location.origin : 'https://tu-servicio.run.app';
 
   const copyBlock = (key: string, text: string) => {
     soundEngine.click();
@@ -34,56 +34,35 @@ export const DropletDeployView: React.FC<DropletDeployViewProps> = ({
     }
   };
 
-  const dropletSetupScript = `# 1. Actualizar Ubuntu 24.04 e instalar Node.js 22 + PM2 + Nginx
-sudo apt update && sudo apt upgrade -y
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo apt install -y nodejs nginx certbot python3-certbot-nginx ufw
+  const cloudRunDeployCmd = `# 1. Desplegar tug777-engine 24/7 en Google Cloud Run (región us-east1 junto a mcloud)
+gcloud run deploy tug777-engine \\
+  --source . \\
+  --region us-east1 \\
+  --platform managed \\
+  --allow-unauthenticated \\
+  --min-instances 1 \\
+  --max-instances 1 \\
+  --no-cpu-throttling \\
+  --port 8080 \\
+  --set-env-vars "NODE_ENV=production,HL_NETWORK=mainnet,MCLOUD_URL=https://mcloud-1036926196544.us-east1.run.app,TUG777_ENGINE_TOKEN=TUG777_ENGINE"`;
 
-# 2. Instalar PM2 global para ejecución 24/7 con auto-reinicio
-sudo npm install -g pm2 tsx
-
-# 3. Clonar / subir proyecto y compilar frontend
-cd /opt/tug777-hypertrade
-npm install
-npm run build`;
-
-  const envTemplate = `NODE_ENV=production
-PORT=3000
+  const secretsEnvTemplate = `# 2. Variables / Secretos recomendados en Cloud Run (Secret Manager / --set-secrets)
 GEMINI_API_KEY="TU_GEMINI_API_KEY"
-APP_URL="https://tu-subdominio.com"
-# Opcional para ejecución autónoma 24/7 en el servidor:
-HL_NETWORK="mainnet"
-HL_MASTER_ADDRESS="0xTuMasterAddress"`;
+HL_MASTER_ADDRESS="0xTuMasterAddress"
+# Opcional para ejecución autónoma 24/7 sin depender del teléfono:
+HL_API_PRIVATE_KEY="0xTuAgentPrivateKey"
+MCLOUD_URL="https://mcloud-1036926196544.us-east1.run.app"
+MCLOUD_API_KEY="TU_CLAVE_MC_LIVE_DE_MCLOUD"
+MCLOUD_SECRET="TU_WEBHOOK_SECRET_HMAC"
+ENGINE_AUTH_TOKEN="TOKEN_INTERNO_THIN_CLIENT"`;
 
-  const pm2AndNginx = `# 4. Iniciar servidor en modo 24/7 con PM2
-NODE_ENV=production pm2 start "npx tsx server.ts" --name tug777-hypertrade
-pm2 save
-pm2 startup
+  const verifyEndpointsCmd = `# 3. Verificar salud de tug777-engine (siempre arranca en PAUSA por seguridad)
+curl -s https://TU_SERVICIO_TUG777.us-east1.run.app/api/health
+curl -s https://TU_SERVICIO_TUG777.us-east1.run.app/api/engine/state
 
-# 5. Configurar Firewall UFW
-sudo ufw allow OpenSSH
-sudo ufw allow 'Nginx Full'
-sudo ufw --force enable
-
-# 6. /etc/nginx/sites-available/tug777
-server {
-    listen 80;
-    server_name tu-subdominio.com;
-
-    location / {
-        proxy_pass http://127.0.0.1:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
-    }
-}
-
-# 7. Activar HTTPS gratuito para WebSockets + PWA/APK
-sudo ln -s /etc/nginx/sites-available/tug777 /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-sudo certbot --nginx -d tu-subdominio.com`;
+# 4. Verificar webhook activo de Montana Cloud (mcloud)
+curl -s -X POST https://mcloud-1036926196544.us-east1.run.app/api/wh/tug777 \\
+  -H "Content-Type: application/json" -d '{"evento":"health_probe","origen":"tug777-engine"}'`;
 
   return (
     <div className="space-y-6 max-w-5xl mx-auto">
@@ -93,11 +72,11 @@ sudo certbot --nginx -d tu-subdominio.com`;
           <div className="flex items-center gap-2 text-amber-400">
             <Smartphone className="w-5 h-5" />
             <h2 className="text-base font-bold text-slate-100">
-              App Android (.apk Firmado + Instalación Directa)
+              App Android (.apk Firmado — Thin Client Conectado a Cloud Run + mcloud)
             </h2>
           </div>
           <p className="text-xs text-slate-400 max-w-2xl">
-            Descarga e instala directamente el archivo <code className="text-amber-300">TUG777-HyperTrade.apk</code> firmado para Android 7–15 (con soporte de audio, voz manos libres y selector de servidor para tu Droplet).
+            Descarga e instala <code className="text-amber-300">TUG777-HyperTrade.apk</code> para Android 7–15. Funciona como panel de control ligero conectado vía REST + WebSocket (<code className="text-emerald-300">/ws</code>) a tu motor 24/7 <code className="text-sky-300">tug777-engine</code> en Cloud Run, evitando cierres por batería o red móvil.
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2.5 shrink-0">
@@ -123,75 +102,72 @@ sudo certbot --nginx -d tu-subdominio.com`;
         </div>
       </div>
 
-      {/* DigitalOcean Droplet 24/7 Guide */}
+      {/* Google Cloud Run 24/7 + Montana Cloud Guide */}
       <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg overflow-hidden">
         <div className="px-6 py-4 border-b border-slate-800 flex items-center gap-2.5">
-          <Server className="w-5 h-5 text-sky-400" />
+          <Cloud className="w-5 h-5 text-sky-400" />
           <div>
             <h2 className="text-base font-bold text-slate-100">
-              Despliegue 24/7 en DigitalOcean Droplet (Ubuntu 24.04 LTS)
+              Motor 24/7 en Google Cloud Run (`tug777-engine`, us-east1) + Montana Cloud (`mcloud`)
             </h2>
             <p className="text-xs text-slate-400">
-              Baja latencia recomendada: Región NYC1 / NYC3 o FRA1 · Mínimo 1 vCPU / 2 GB RAM
+              WebSocket persistente a Hyperliquid · Instancia única siempre activa (`--min-instances=1 --max-instances=1 --no-cpu-throttling`) · Arranque seguro en PAUSA
             </p>
           </div>
         </div>
 
         <div className="p-6 space-y-6">
-          {/* Step 1 */}
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold text-slate-200">
-                Paso 1 · Preparar Droplet Ubuntu, Node.js 22 y Compilar
+                Paso 1 · Desplegar `tug777-engine` en Cloud Run (us-east1) con `Dockerfile` incluido
               </span>
               <button
-                onClick={() => copyBlock('step1', dropletSetupScript)}
+                onClick={() => copyBlock('cloudrun', cloudRunDeployCmd)}
                 className="inline-flex items-center gap-1 text-xs text-amber-400 hover:text-amber-300"
               >
-                {copiedKey === 'step1' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                {copiedKey === 'step1' ? 'Copiado' : 'Copiar'}
+                {copiedKey === 'cloudrun' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                {copiedKey === 'cloudrun' ? 'Copiado' : 'Copiar'}
               </button>
             </div>
             <pre className="p-4 rounded-md bg-[#090B0E] border border-slate-800 text-xs font-mono-tabular text-slate-300 overflow-x-auto">
-              {dropletSetupScript}
+              {cloudRunDeployCmd}
             </pre>
           </div>
 
-          {/* Step 2 */}
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold text-slate-200">
-                Paso 2 · Archivo de Entorno (.env) en /opt/tug777-hypertrade/.env
+                Paso 2 · Variables y Secretos en Cloud Run (Sin exponer llaves en la APK)
               </span>
               <button
-                onClick={() => copyBlock('env', envTemplate)}
+                onClick={() => copyBlock('secrets', secretsEnvTemplate)}
                 className="inline-flex items-center gap-1 text-xs text-amber-400 hover:text-amber-300"
               >
-                {copiedKey === 'env' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                {copiedKey === 'env' ? 'Copiado' : 'Copiar'}
+                {copiedKey === 'secrets' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                {copiedKey === 'secrets' ? 'Copiado' : 'Copiar'}
               </button>
             </div>
             <pre className="p-4 rounded-md bg-[#090B0E] border border-slate-800 text-xs font-mono-tabular text-slate-300 overflow-x-auto">
-              {envTemplate}
+              {secretsEnvTemplate}
             </pre>
           </div>
 
-          {/* Step 3 */}
           <div className="space-y-2">
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold text-slate-200">
-                Paso 3 · Daemon 24/7 con PM2, Firewall UFW, Nginx y SSL Certbot
+                Paso 3 · Verificar Salud de `tug777-engine` y Montana Cloud (`mcloud`)
               </span>
               <button
-                onClick={() => copyBlock('pm2', pm2AndNginx)}
+                onClick={() => copyBlock('verify', verifyEndpointsCmd)}
                 className="inline-flex items-center gap-1 text-xs text-amber-400 hover:text-amber-300"
               >
-                {copiedKey === 'pm2' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                {copiedKey === 'pm2' ? 'Copiado' : 'Copiar'}
+                {copiedKey === 'verify' ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                {copiedKey === 'verify' ? 'Copiado' : 'Copiar'}
               </button>
             </div>
             <pre className="p-4 rounded-md bg-[#090B0E] border border-slate-800 text-xs font-mono-tabular text-slate-300 overflow-x-auto">
-              {pm2AndNginx}
+              {verifyEndpointsCmd}
             </pre>
           </div>
         </div>

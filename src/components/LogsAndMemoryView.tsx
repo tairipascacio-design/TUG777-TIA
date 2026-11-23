@@ -1,7 +1,13 @@
 import React, { useState } from 'react';
-import { BookOpen, Brain, ShieldCheck } from 'lucide-react';
-import { DEFAULT_STRATEGY_PLAYBOOK, POSITION_MANAGEMENT_GUIDE_RULES } from '../services/strategyEngine';
+import { BookOpen, Brain, ShieldAlert, ShieldCheck } from 'lucide-react';
+import {
+  DEFAULT_STRATEGY_PLAYBOOK,
+  POSITION_MANAGEMENT_GUIDE_RULES,
+  getStrategySampleStatus,
+  isNegativeMemoryRule,
+} from '../services/strategyEngine';
 import type { AiMemoryEntry, StrategyPlaybookItem, TradeLogEntry } from '../types/trading';
+import { formatSignedUsd } from '../utils/formatters';
 import { soundEngine } from '../utils/soundEngine';
 
 interface LogsAndMemoryViewProps {
@@ -9,6 +15,7 @@ interface LogsAndMemoryViewProps {
   memories: AiMemoryEntry[];
   playbook: StrategyPlaybookItem[];
   onToggleStrategy?: (strategyId: string, enabled: boolean) => void;
+  onUpdateStrategy?: (strategyId: string, patch: { enabled?: boolean; weight?: number }) => void;
 }
 
 export const LogsAndMemoryView: React.FC<LogsAndMemoryViewProps> = ({
@@ -16,10 +23,23 @@ export const LogsAndMemoryView: React.FC<LogsAndMemoryViewProps> = ({
   memories,
   playbook,
   onToggleStrategy,
+  onUpdateStrategy,
 }) => {
   const [filter, setFilter] = useState<'ALL' | 'EXEC' | 'MEV_GUARD' | 'INFO' | 'ERROR'>('ALL');
+  const [memoryTab, setMemoryTab] = useState<'POSITIVE' | 'NEGATIVE' | 'ALL'>('POSITIVE');
 
   const filteredLogs = filter === 'ALL' ? logs : logs.filter((l) => l.level === filter);
+
+  const positiveMemories = memories.filter(
+    (m) => !isNegativeMemoryRule(m) && (m.outcome === 'WIN' || m.regime.toUpperCase().startsWith('SI_ENTRAR'))
+  );
+  const negativeMemories = memories.filter((m) => isNegativeMemoryRule(m));
+  const displayedMemories =
+    memoryTab === 'POSITIVE'
+      ? positiveMemories
+      : memoryTab === 'NEGATIVE'
+      ? negativeMemories
+      : memories;
 
   const effectivePlaybook: StrategyPlaybookItem[] =
     playbook.length > 0
@@ -35,17 +55,17 @@ export const LogsAndMemoryView: React.FC<LogsAndMemoryViewProps> = ({
 
   return (
     <div className="space-y-6">
-      {/* Unified 10-Strategy Playbook + Position Management Guide (Synced with Firestore) */}
+      {/* Unified 10-Strategy Playbook + Position Management Guide (Synced with Firestore & ALL AI models) */}
       <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg overflow-hidden">
         <div className="px-5 py-4 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2.5">
             <BookOpen className="w-4 h-4 text-amber-400" />
             <div>
               <h2 className="text-base font-bold text-slate-100">
-                Biblioteca Unificada de Estrategias y Guía de Gestión de Posiciones (Base de Datos)
+                Biblioteca Unificada de Estrategias y Guía de Posiciones (Sincronizada en Todos los Modelos)
               </h2>
               <p className="text-xs text-slate-400">
-                10 estrategias institucionales en cruce vivo con Firestore · Los pesos (0.30x–2.50x) se auto-ajustan según el rendimiento real
+                10 estrategias configurables · Calibración honesta (&gt;=25 ops para mover peso; si PnL &lt; $0 peso &lt;= 1.0x)
               </p>
             </div>
           </div>
@@ -90,23 +110,79 @@ export const LogsAndMemoryView: React.FC<LogsAndMemoryViewProps> = ({
                     <div className="text-slate-200">{st.entryRule}</div>
                     <div className="text-slate-500 mt-0.5">{st.positionManagementGuide}</div>
                   </td>
-                  <td className="py-3 px-4 text-right font-mono-tabular font-bold text-amber-300">
-                    {st.weight.toFixed(2)}x
+                  <td className="py-3 px-4 text-right font-mono-tabular">
+                    <div className="inline-flex items-center gap-1.5">
+                      {onUpdateStrategy && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            soundEngine.click();
+                            onUpdateStrategy(st.strategyId, {
+                              weight: Math.max(0.3, Number((st.weight - 0.1).toFixed(2))),
+                            });
+                          }}
+                          className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px]"
+                        >
+                          -
+                        </button>
+                      )}
+                      <span className="font-bold text-amber-300 w-10 text-center">
+                        {st.weight.toFixed(2)}x
+                      </span>
+                      {onUpdateStrategy && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            soundEngine.click();
+                            onUpdateStrategy(st.strategyId, {
+                              weight: Math.min(2.5, Number((st.weight + 0.1).toFixed(2))),
+                            });
+                          }}
+                          className="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px]"
+                        >
+                          +
+                        </button>
+                      )}
+                    </div>
                   </td>
                   <td className="py-3 px-4 text-right font-mono-tabular">
-                    <span className="text-emerald-400">{st.wins}W</span>
-                    {' / '}
-                    <span className="text-red-400">{st.losses}L</span>
-                    <div className={st.totalPnlUsd >= 0 ? 'text-emerald-400' : 'text-red-400'}>
-                      {st.totalPnlUsd >= 0 ? '+' : ''}${st.totalPnlUsd.toFixed(2)}
-                    </div>
+                    {(() => {
+                      const sample = getStrategySampleStatus(st);
+                      return (
+                        <>
+                          <div>
+                            <span className="text-emerald-400">{st.wins}W</span>
+                            {' / '}
+                            <span className="text-red-400">{st.losses}L</span>
+                          </div>
+                          <div
+                            className={`text-[10px] ${
+                              sample.proven
+                                ? 'text-emerald-300'
+                                : sample.status === 'MUESTRA_BAJA'
+                                ? 'text-amber-300'
+                                : 'text-slate-500'
+                            }`}
+                          >
+                            {sample.proven ? sample.label : `${sample.label} · neutro 1.0x`}
+                          </div>
+                          <div className={st.totalPnlUsd >= 0 ? 'text-emerald-400' : 'text-red-400'}>
+                            {formatSignedUsd(st.totalPnlUsd)}
+                          </div>
+                        </>
+                      );
+                    })()}
                   </td>
                   <td className="py-3 px-4 text-right">
                     <button
-                      disabled={!onToggleStrategy}
+                      disabled={!onToggleStrategy && !onUpdateStrategy}
                       onClick={() => {
                         soundEngine.click();
-                        onToggleStrategy?.(st.strategyId, !st.enabled);
+                        if (onUpdateStrategy) {
+                          onUpdateStrategy(st.strategyId, { enabled: !st.enabled });
+                        } else {
+                          onToggleStrategy?.(st.strategyId, !st.enabled);
+                        }
                       }}
                       className={`px-2.5 py-1 rounded text-[11px] font-bold ${
                         st.enabled
@@ -131,7 +207,7 @@ export const LogsAndMemoryView: React.FC<LogsAndMemoryViewProps> = ({
             <div>
               <h2 className="text-base font-bold text-slate-100">Logs de Ejecución y Escudo MEV</h2>
               <p className="text-xs text-slate-400">
-                Auditoría persistente en Firestore · Latencia real medida por operación
+                Auditoría persistente · Latencia histórica ACK/Fill y degradaciones registradas
               </p>
             </div>
             <div className="flex items-center gap-1 bg-[#090B0E] p-1 rounded-md border border-slate-800">
@@ -194,49 +270,118 @@ export const LogsAndMemoryView: React.FC<LogsAndMemoryViewProps> = ({
           </div>
         </div>
 
-        {/* Right: AI Unified Brain Learned Memory */}
+        {/* Right: Separated AI Learning — CUÁNDO SÍ ENTRAR vs CUÁNDO NO ENTRAR */}
         <div className="xl:col-span-5 bg-[#0F131A] border border-slate-800/90 rounded-lg overflow-hidden flex flex-col">
-          <div className="px-5 py-4 border-b border-slate-800/80 flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Brain className="w-4 h-4 text-amber-400" />
-              <div>
-                <h2 className="text-base font-bold text-slate-100">Memoria Evolutiva de la IA</h2>
-                <p className="text-xs text-slate-400">
-                  Reglas aprendidas de trades reales consultadas antes de cada entrada
-                </p>
+          <div className="px-5 py-4 border-b border-slate-800/80 space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Brain className="w-4 h-4 text-amber-400" />
+                <div>
+                  <h2 className="text-base font-bold text-slate-100">
+                    Aprendizaje Separado: SÍ Entrar vs NO Entrar
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    +{positiveMemories.length} ventajas confirmadas · {negativeMemories.length} filtros anti-error (sin ruido duplicado)
+                  </p>
+                </div>
               </div>
+              {memoryTab === 'NEGATIVE' ? (
+                <ShieldAlert className="w-4 h-4 text-red-400" />
+              ) : (
+                <ShieldCheck className="w-4 h-4 text-emerald-400" />
+              )}
             </div>
-            <ShieldCheck className="w-4 h-4 text-emerald-400" />
+
+            <div className="grid grid-cols-3 gap-1.5 bg-[#090B0E] p-1 rounded-md border border-slate-800 text-[11px] font-semibold">
+              <button
+                type="button"
+                onClick={() => {
+                  soundEngine.click();
+                  setMemoryTab('POSITIVE');
+                }}
+                className={`py-1.5 px-2 rounded transition-colors ${
+                  memoryTab === 'POSITIVE'
+                    ? 'bg-emerald-600/25 text-emerald-300 border border-emerald-500/40'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                SÍ ENTRAR ({positiveMemories.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  soundEngine.click();
+                  setMemoryTab('NEGATIVE');
+                }}
+                className={`py-1.5 px-2 rounded transition-colors ${
+                  memoryTab === 'NEGATIVE'
+                    ? 'bg-red-600/25 text-red-300 border border-red-500/40'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                NO ENTRAR ({negativeMemories.length})
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  soundEngine.click();
+                  setMemoryTab('ALL');
+                }}
+                className={`py-1.5 px-2 rounded transition-colors ${
+                  memoryTab === 'ALL'
+                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Todo ({memories.length})
+              </button>
+            </div>
           </div>
 
           <div className="divide-y divide-slate-800/60 max-h-[540px] overflow-y-auto">
-            {memories.length === 0 ? (
+            {displayedMemories.length === 0 ? (
               <div className="py-12 px-6 text-center text-sm text-slate-500">
-                Cada trade cerrado destila automáticamente una lección táctica y la guarda en Firestore para mejorar las próximas decisiones del Cerebro Unificado.
+                {memoryTab === 'POSITIVE'
+                  ? 'Aún no hay reglas destiladas de CUÁNDO SÍ ENTRAR. Cierra trades o presiona "Aprender del Historial" en PnL.'
+                  : memoryTab === 'NEGATIVE'
+                  ? 'Sin bloqueos de CUÁNDO NO ENTRAR todavía. Los errores y patrones perdedores se filtran aquí.'
+                  : 'Cada trade cerrado destila reglas separadas SÍ/NO Entrar sin duplicar basura.'}
               </div>
             ) : (
-              memories.map((mem) => (
-                <div key={mem.id} className="p-4 space-y-1.5">
-                  <div className="flex items-center justify-between text-xs font-mono-tabular">
-                    <div>
-                      <span className="font-bold text-slate-100 font-sans">{mem.coin}</span>{' '}
-                      <span className="text-slate-500">· {mem.regime}</span>
+              displayedMemories.map((mem) => {
+                const isNeg = isNegativeMemoryRule(mem);
+                return (
+                  <div key={mem.id} className="p-4 space-y-1.5">
+                    <div className="flex items-center justify-between text-xs font-mono-tabular">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span
+                          className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                            isNeg
+                              ? 'bg-red-500/20 text-red-300 border border-red-500/30'
+                              : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                          }`}
+                        >
+                          {isNeg ? 'NO ENTRAR' : 'SÍ ENTRAR'}
+                        </span>
+                        <span className="font-bold text-slate-100 font-sans">{mem.coin}</span>
+                        <span className="text-slate-500 truncate">· {mem.regime}</span>
+                      </div>
+                      <span
+                        className={`font-semibold shrink-0 ${
+                          mem.outcome === 'WIN'
+                            ? 'text-emerald-400'
+                            : mem.outcome === 'LOSS'
+                            ? 'text-red-400'
+                            : 'text-slate-400'
+                        }`}
+                      >
+                        {mem.outcome} ({mem.pnlUsd >= 0 ? '+' : ''}${mem.pnlUsd.toFixed(2)})
+                      </span>
                     </div>
-                    <span
-                      className={`font-semibold ${
-                        mem.outcome === 'WIN'
-                          ? 'text-emerald-400'
-                          : mem.outcome === 'LOSS'
-                          ? 'text-red-400'
-                          : 'text-slate-400'
-                      }`}
-                    >
-                      {mem.outcome} ({mem.pnlUsd >= 0 ? '+' : ''}${mem.pnlUsd.toFixed(2)})
-                    </span>
+                    <p className="text-xs text-slate-300 leading-relaxed">{mem.lesson}</p>
                   </div>
-                  <p className="text-xs text-slate-300 leading-relaxed">{mem.lesson}</p>
-                </div>
-              ))
+                );
+              })
             )}
           </div>
         </div>

@@ -1,5 +1,12 @@
 import { initializeApp } from 'firebase/app';
-import { GoogleAuthProvider, getAuth, signInWithPopup, signOut } from 'firebase/auth';
+import {
+  GoogleAuthProvider,
+  getAuth,
+  getRedirectResult,
+  signInWithPopup,
+  signInWithRedirect,
+  signOut,
+} from 'firebase/auth';
 import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
@@ -74,8 +81,47 @@ export async function testFirestoreConnection(): Promise<boolean> {
   }
 }
 
+export const FIREBASE_PROJECT_ID = firebaseConfig.projectId;
+export const FIREBASE_AUTH_SETTINGS_URL = `https://console.firebase.google.com/project/${firebaseConfig.projectId}/authentication/settings`;
+
+const isStandaloneFirebaseHost = () =>
+  typeof window !== 'undefined' &&
+  (window.location.hostname === `${firebaseConfig.projectId}.web.app` ||
+    window.location.hostname === `${firebaseConfig.projectId}.firebaseapp.com`);
+
+export async function checkRedirectAuthResult() {
+  if (!isStandaloneFirebaseHost()) return null;
+  try {
+    return await getRedirectResult(auth);
+  } catch {
+    return null;
+  }
+}
+
 export async function signInWithGoogle() {
-  return signInWithPopup(auth, googleProvider);
+  if (typeof window !== 'undefined' && window.location.hostname === '127.0.0.1') {
+    const nextUrl = new URL(window.location.href);
+    nextUrl.hostname = 'localhost';
+    window.location.replace(nextUrl.toString());
+    throw new Error('Redirigiendo a localhost para habilitar Google OAuth...');
+  }
+  try {
+    return await signInWithPopup(auth, googleProvider);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Inside the standalone Android APK (.web.app), fall back to in-WebView redirect if popup is blocked/unsupported
+    if (
+      isStandaloneFirebaseHost() &&
+      (msg.includes('popup-blocked') ||
+        msg.includes('popup-closed-by-user') ||
+        msg.includes('cancelled-popup-request') ||
+        msg.includes('operation-not-supported'))
+    ) {
+      await signInWithRedirect(auth, googleProvider);
+      return null;
+    }
+    throw err;
+  }
 }
 
 export async function signOutUser() {

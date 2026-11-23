@@ -107,19 +107,19 @@ export const LiveCandleChart: React.FC<LiveCandleChartProps> = ({
       </div>
 
       {/* SVG Candle Canvas */}
-      <div className="relative p-3">
+      <div className="relative p-2">
         {loading && candles.length === 0 ? (
-          <div className="h-[340px] flex items-center justify-center text-sm text-slate-400 font-mono-tabular">
+          <div className="h-[300px] flex items-center justify-center text-sm text-slate-400 font-mono-tabular">
             Cargando velas reales de Hyperliquid...
           </div>
         ) : !chartStats || candles.length === 0 ? (
-          <div className="h-[340px] flex items-center justify-center text-sm text-slate-500">
+          <div className="h-[300px] flex items-center justify-center text-sm text-slate-500">
             Sin datos de velas disponibles para {coin}.
           </div>
         ) : (
           <svg
             viewBox={`0 0 ${width} ${height}`}
-            className="w-full h-[320px] select-none"
+            className="w-full h-[300px] select-none"
             onMouseLeave={() => setHoverIdx(null)}
           >
             {/* Horizontal grid lines */}
@@ -128,12 +128,12 @@ export const LiveCandleChart: React.FC<LiveCandleChartProps> = ({
               const priceAtY = chartStats.topP - ratio * (chartStats.topP - chartStats.botP);
               return (
                 <g key={ratio}>
-                  <line x1={0} y1={y} x2={width - 74} y2={y} stroke="#1E293B" strokeDasharray="3 3" strokeWidth={1} />
+                  <line x1={0} y1={y} x2={width - 88} y2={y} stroke="#1E293B" strokeDasharray="3 3" strokeWidth={1} />
                   <text
-                    x={width - 68}
+                    x={width - 82}
                     y={y + 4}
-                    fill="#64748B"
-                    fontSize="10"
+                    fill="#94A3B8"
+                    fontSize="12"
                     fontFamily="JetBrains Mono, monospace"
                   >
                     {formatPx(priceAtY)}
@@ -150,7 +150,7 @@ export const LiveCandleChart: React.FC<LiveCandleChartProps> = ({
               opacity={0.85}
               points={chartStats.ema9
                 .map((val, idx) => {
-                  const step = (width - 84) / candles.length;
+                  const step = (width - 94) / candles.length;
                   const x = idx * step + step * 0.5;
                   const y = ((chartStats.topP - val) / (chartStats.topP - chartStats.botP)) * priceHeight;
                   return `${x},${y}`;
@@ -164,7 +164,7 @@ export const LiveCandleChart: React.FC<LiveCandleChartProps> = ({
               opacity={0.8}
               points={chartStats.ema21
                 .map((val, idx) => {
-                  const step = (width - 84) / candles.length;
+                  const step = (width - 94) / candles.length;
                   const x = idx * step + step * 0.5;
                   const y = ((chartStats.topP - val) / (chartStats.topP - chartStats.botP)) * priceHeight;
                   return `${x},${y}`;
@@ -174,7 +174,7 @@ export const LiveCandleChart: React.FC<LiveCandleChartProps> = ({
 
             {/* Candles & Volume */}
             {candles.map((c, idx) => {
-              const plotW = width - 84;
+              const plotW = width - 94;
               const step = plotW / candles.length;
               const candleW = Math.max(2, step * 0.64);
               const xCenter = idx * step + step * 0.5;
@@ -211,9 +211,9 @@ export const LiveCandleChart: React.FC<LiveCandleChartProps> = ({
               <g>
                 {(() => {
                   const yMark = Math.max(
-                    8,
+                    10,
                     Math.min(
-                      priceHeight - 8,
+                      priceHeight - 10,
                       ((chartStats.topP - markPx) / (chartStats.topP - chartStats.botP)) * priceHeight
                     )
                   );
@@ -222,18 +222,18 @@ export const LiveCandleChart: React.FC<LiveCandleChartProps> = ({
                       <line
                         x1={0}
                         y1={yMark}
-                        x2={width - 74}
+                        x2={width - 88}
                         y2={yMark}
                         stroke="#F59E0B"
                         strokeDasharray="2 2"
                         strokeWidth={1}
                       />
-                      <rect x={width - 72} y={yMark - 9} width={70} height={18} rx={3} fill="#F59E0B" />
+                      <rect x={width - 86} y={yMark - 10} width={84} height={20} rx={3} fill="#F59E0B" />
                       <text
-                        x={width - 67}
-                        y={yMark + 3}
+                        x={width - 80}
+                        y={yMark + 4}
                         fill="#090B0E"
-                        fontSize="10"
+                        fontSize="11.5"
                         fontWeight="700"
                         fontFamily="JetBrains Mono, monospace"
                       >

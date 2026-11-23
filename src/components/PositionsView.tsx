@@ -1,6 +1,7 @@
 import React from 'react';
-import { RefreshCw, XCircle } from 'lucide-react';
+import { RefreshCw, ShieldAlert, XCircle } from 'lucide-react';
 import type { HlAccountSummary, HlAssetMarket, PersistedPosition } from '../types/trading';
+import { formatSignedUsd, formatUsd } from '../utils/formatters';
 import { soundEngine } from '../utils/soundEngine';
 
 interface PositionsViewProps {
@@ -13,6 +14,7 @@ interface PositionsViewProps {
   closingAll?: boolean;
   syncingAccount: boolean;
   lastSyncedAt: number | null;
+  partialStagesByCoin?: Record<string, number>;
   onRefreshAccount: () => void;
   onCloseLivePosition: (coin: string, side: 'LONG' | 'SHORT', size: number) => void;
   onCloseAllPositions?: () => void;
@@ -30,6 +32,7 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
   closingAll = false,
   syncingAccount,
   lastSyncedAt,
+  partialStagesByCoin = {},
   onRefreshAccount,
   onCloseLivePosition,
   onCloseAllPositions,
@@ -46,25 +49,25 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
         <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg p-4">
           <p className="text-xs text-slate-400">Equity Hyperliquid</p>
           <p className="mt-1 text-xl font-bold font-mono-tabular text-slate-100">
-            ${(accountSummary?.accountValue ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {formatUsd(accountSummary?.accountValue ?? 0)}
           </p>
         </div>
         <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg p-4">
           <p className="text-xs text-slate-400">Margen Utilizado</p>
           <p className="mt-1 text-xl font-bold font-mono-tabular text-amber-400">
-            ${(accountSummary?.totalMarginUsed ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {formatUsd(accountSummary?.totalMarginUsed ?? 0)}
           </p>
         </div>
         <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg p-4">
           <p className="text-xs text-slate-400">Exposición Nocional</p>
           <p className="mt-1 text-xl font-bold font-mono-tabular text-slate-100">
-            ${(accountSummary?.totalNtlPos ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {formatUsd(accountSummary?.totalNtlPos ?? 0)}
           </p>
         </div>
         <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg p-4">
           <p className="text-xs text-slate-400">USDC Retirable</p>
           <p className="mt-1 text-xl font-bold font-mono-tabular text-emerald-400">
-            ${(accountSummary?.withdrawable ?? 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            {formatUsd(accountSummary?.withdrawable ?? 0)}
           </p>
         </div>
       </div>
@@ -107,8 +110,8 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
                 {closingAll
                   ? 'Cerrando Todas...'
                   : hasApiKey
-                  ? `Cerrar Todas (${accountSummary.positions.length})`
-                  : 'Conectar Key y Cerrar Todas'}
+                  ? `Cerrar TUG777 (${accountSummary.positions.filter((p) => !p.isExternal).length})`
+                  : 'Conectar Key y Cerrar'}
               </button>
             )}
             {(!masterWalletAddress || !hasApiKey) && (
@@ -151,11 +154,36 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
               ) : (
                 accountSummary.positions.map((pos) => {
                   const market = marketsByCoin.get(pos.coin);
-                  const mark = market?.markPx ?? 0;
+                  const mark = market?.markPx ?? pos.entryPx;
+                  const stage = partialStagesByCoin[pos.coin] ?? 0;
+                  const liqDistPct =
+                    pos.liquidationPx && pos.liquidationPx > 0 && mark > 0
+                      ? pos.side === 'LONG'
+                        ? ((mark - pos.liquidationPx) / mark) * 100
+                        : ((pos.liquidationPx - mark) / mark) * 100
+                      : null;
                   return (
                     <tr key={pos.coin} className="hover:bg-slate-800/30 transition-colors">
                       <td className="py-3 px-4 font-bold text-slate-100 font-sans">
                         {pos.coin} <span className="text-slate-400 font-normal">· {pos.leverage}x</span>
+                        {pos.isExternal ? (
+                          <span
+                            title="Posición ajena a TUG777 (sin cloid 0x777): el motor automático NO la toca"
+                            className="ml-2 inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-sky-500/15 border border-sky-500/40 text-sky-300 text-[10px] font-mono-tabular"
+                          >
+                            <ShieldAlert className="w-3 h-3" />
+                            [EXTERNA]
+                          </span>
+                        ) : (
+                          <span className="ml-2 px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 text-[10px] font-mono-tabular">
+                            TUG777
+                          </span>
+                        )}
+                        {stage > 0 && (
+                          <span className="ml-2 text-[10px] font-mono-tabular text-emerald-400 font-semibold">
+                            TP{stage} OK (BE)
+                          </span>
+                        )}
                       </td>
                       <td className={`py-3 px-4 font-semibold ${pos.side === 'LONG' ? 'text-emerald-400' : 'text-red-400'}`}>
                         {pos.side}
@@ -163,16 +191,21 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
                       <td className="py-3 px-4 text-right text-slate-200">{Math.abs(pos.szi).toFixed(4)}</td>
                       <td className="py-3 px-4 text-right text-slate-300">${pos.entryPx.toFixed(4)}</td>
                       <td className="py-3 px-4 text-right text-slate-200">${mark.toFixed(4)}</td>
-                      <td className="py-3 px-4 text-right text-amber-400">
-                        {pos.liquidationPx ? `$${pos.liquidationPx.toFixed(2)}` : '--'}
+                      <td
+                        className={`py-3 px-4 text-right ${
+                          liqDistPct !== null && liqDistPct < 5 ? 'text-red-400 font-bold' : 'text-amber-400'
+                        }`}
+                      >
+                        {pos.liquidationPx
+                          ? `$${pos.liquidationPx.toFixed(2)}${liqDistPct !== null ? ` (${liqDistPct.toFixed(1)}%)` : ''}`
+                          : '--'}
                       </td>
                       <td
                         className={`py-3 px-4 text-right font-semibold ${
                           pos.unrealizedPnl >= 0 ? 'text-emerald-400' : 'text-red-400'
                         }`}
                       >
-                        {pos.unrealizedPnl >= 0 ? '+' : ''}
-                        ${pos.unrealizedPnl.toFixed(2)} ({pos.returnOnEquity.toFixed(1)}%)
+                        {formatSignedUsd(pos.unrealizedPnl)} ({pos.returnOnEquity.toFixed(1)}%)
                       </td>
                       <td className="py-3 px-4 text-right">
                         <button
@@ -205,10 +238,10 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
         <div className="px-5 py-4 border-b border-slate-800/80 flex items-center justify-between">
           <div>
             <h2 className="text-base font-bold text-slate-100">
-              Posiciones Persistidas en Base de Datos (Firestore)
+              Posiciones Persistidas en Base de Datos (Historial Acumulativo)
             </h2>
             <p className="text-xs text-slate-400">
-              Respaldo automático en la nube ante recargas de página · Abiertas: {openPersisted.length} · Cerradas: {closedPersisted.length}
+              Cada nueva posición se adhiere sin borrar las anteriores · Total: {persistedPositions.length} (Abiertas: {openPersisted.length} · Cerradas: {closedPersisted.length})
             </p>
           </div>
         </div>
@@ -249,6 +282,11 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
                           {p.side}
                         </span>{' '}
                         <span className="text-slate-500">· {p.mode}</span>
+                        {p.isExternal && (
+                          <span className="ml-1.5 px-1 py-0.5 rounded bg-sky-500/15 text-sky-300 text-[9px] font-mono-tabular">
+                            [EXTERNA]
+                          </span>
+                        )}
                       </td>
                       <td className="py-3 px-4">
                         <span className={p.status === 'OPEN' ? 'text-amber-400 font-semibold' : 'text-slate-400'}>
@@ -262,7 +300,7 @@ export const PositionsView: React.FC<PositionsViewProps> = ({
                           livePnl >= 0 ? 'text-emerald-400' : 'text-red-400'
                         }`}
                       >
-                        {livePnl >= 0 ? '+' : ''}${livePnl.toFixed(2)}
+                        {formatSignedUsd(livePnl)}
                       </td>
                       <td className="py-3 px-4 font-sans text-slate-400 max-w-xs truncate">{p.thesis}</td>
                       <td className="py-3 px-4 text-right">

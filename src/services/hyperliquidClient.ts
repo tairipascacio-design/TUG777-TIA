@@ -1,19 +1,201 @@
 import { encode } from '@msgpack/msgpack';
-import { Signature, Wallet, concat, getBytes, keccak256 } from 'ethers';
+import { Signature, Wallet, concat, keccak256 } from 'ethers';
 import type {
+  BotConfigData,
+  EngineStateSnapshot,
+  EngineWsMessage,
   HlAccountSummary,
   HlAssetMarket,
   HlCandle,
+  HlExecutionRoute,
   HlL2Level,
   HlNetwork,
   HlUserFill,
+  MevFilterAudit,
   MevProbeStatus,
+  OrderFillStatus,
 } from '../types/trading';
+import { computeQuantConfluence } from '../utils/quantConfluence';
+
+export { computeQuantConfluence };
 
 const HL_DIRECT_BASE: Record<HlNetwork, string> = {
   mainnet: 'https://api.hyperliquid.xyz',
   testnet: 'https://api.hyperliquid-testnet.xyz',
 };
+
+const BACKEND_URL_STORAGE_KEY = 'tug777_backend_server_url';
+const TUG777_CLOID_PREFIX = '0x777';
+
+export function isMcloudWebhookOrServiceUrl(url?: string | null): boolean {
+  const cleaned = (url || '').trim();
+  if (!cleaned) return false;
+  return /mcloud-\d+/i.test(cleaned) || /\/api\/wh\//i.test(cleaned);
+}
+
+export function getConfiguredBackendUrl(): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    const val = (localStorage.getItem(BACKEND_URL_STORAGE_KEY) || '').trim().replace(/\/$/, '');
+    if (isMcloudWebhookOrServiceUrl(val)) {
+      localStorage.removeItem(BACKEND_URL_STORAGE_KEY);
+      return '';
+    }
+    return val;
+  } catch {
+    return '';
+  }
+}
+
+export function setConfiguredBackendUrl(url: string) {
+  if (typeof window === 'undefined') return;
+  try {
+    const cleaned = url.trim().replace(/\/$/, '');
+    if (cleaned && !isMcloudWebhookOrServiceUrl(cleaned)) {
+      localStorage.setItem(BACKEND_URL_STORAGE_KEY, cleaned);
+    } else {
+      localStorage.removeItem(BACKEND_URL_STORAGE_KEY);
+    }
+  } catch {
+    // ignore storage limits
+  }
+}
+
+export function isRunningInEmbeddedApk(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    ((window.location.hostname === 'localhost' && window.location.port === '47777') ||
+      window.location.hostname === 'gen-lang-client-0561395731.web.app' ||
+      window.location.hostname === 'gen-lang-client-0561395731.firebaseapp.com')
+  );
+}
+
+export function hasConfiguredBackendForApk(): boolean {
+  return !isRunningInEmbeddedApk() || Boolean(getConfiguredBackendUrl());
+}
+
+export function buildBackendApiUrl(apiPath: string): string {
+  const normalizedPath = apiPath.startsWith('/') ? apiPath : `/${apiPath}`;
+  const customBase = getConfiguredBackendUrl();
+  if (customBase) {
+    return `${customBase}${normalizedPath}`;
+  }
+  return normalizedPath;
+}
+
+export function buildEngineWsUrl(token?: string): string {
+  if (typeof window === 'undefined') return '';
+  const customBase = getConfiguredBackendUrl();
+  const baseHttp = customBase || window.location.origin;
+  const wsBase = baseHttp.replace(/^https:/i, 'wss:').replace(/^http:/i, 'ws:').replace(/\/$/, '');
+  const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+  return `${wsBase}/ws${qs}`;
+}
+
+export function generateTugClientCloid(): string {
+  const bytes = new Uint8Array(15);
+  if (typeof crypto !== 'undefined' && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  const hex = Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('')
+    .slice(0, 29);
+  return `${TUG777_CLOID_PREFIX}${hex}`.toLowerCase();
+}
+
+export function connectEngineWebSocket(handlers: {
+  onMessage: (msg: EngineWsMessage) => void;
+  onStatusChange?: (connected: boolean) => void;
+  token?: string;
+}): { close: () => void; sendSelectFeed: (coin: string, interval: '1m' | '5m' | '15m' | '1h' | '4h') => void } {
+  let ws: WebSocket | null = null;
+  let closedByCaller = false;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let attempt = 0;
+
+  const clearTimers = () => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (pingTimer) {
+      clearInterval(pingTimer);
+      pingTimer = null;
+    }
+  };
+
+  const connect = () => {
+    if (closedByCaller || typeof window === 'undefined' || !hasConfiguredBackendForApk()) return;
+    const url = buildEngineWsUrl(handlers.token);
+    if (!url) return;
+    try {
+      ws = new WebSocket(url);
+    } catch {
+      handlers.onStatusChange?.(false);
+      return;
+    }
+
+    ws.onopen = () => {
+      attempt = 0;
+      handlers.onStatusChange?.(true);
+      pingTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'ping' }));
+        }
+      }, 20_000);
+    };
+
+    ws.onmessage = (ev) => {
+      try {
+        const parsed = JSON.parse(String(ev.data)) as EngineWsMessage;
+        handlers.onMessage(parsed);
+      } catch {
+        // ignore malformed frame
+      }
+    };
+
+    ws.onclose = () => {
+      clearTimers();
+      handlers.onStatusChange?.(false);
+      if (!closedByCaller) {
+        const delay = Math.min(20_000, 1200 * Math.pow(2, Math.min(attempt, 4)));
+        attempt += 1;
+        reconnectTimer = setTimeout(connect, delay);
+      }
+    };
+
+    ws.onerror = () => {
+      handlers.onStatusChange?.(false);
+    };
+  };
+
+  connect();
+
+  return {
+    close: () => {
+      closedByCaller = true;
+      clearTimers();
+      if (ws) {
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+      }
+    },
+    sendSelectFeed: (coin: string, interval: '1m' | '5m' | '15m' | '1h' | '4h') => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'select_feed', coin, interval }));
+      }
+    },
+  };
+}
 
 async function parseJsonSafe<T = unknown>(res: Response): Promise<T> {
   const text = await res.text();
@@ -24,55 +206,193 @@ async function parseJsonSafe<T = unknown>(res: Response): Promise<T> {
   return JSON.parse(trimmed) as T;
 }
 
-export async function hlInfoRequest<T = unknown>(
-  network: HlNetwork,
-  payload: Record<string, unknown>
-): Promise<{ data: T; latencyMs: number; channel: string }> {
+export async function fetchEngineState(): Promise<EngineStateSnapshot | null> {
+  if (!hasConfiguredBackendForApk()) return null;
+  const res = await fetch(buildBackendApiUrl('/api/engine/state'), {
+    headers: { Accept: 'application/json' },
+  });
+  if (!res.ok) return null;
+  return parseJsonSafe<EngineStateSnapshot>(res);
+}
+
+export async function controlEngine(
+  action: 'START' | 'PAUSE' | 'ANALYZE_NOW' | 'SELECT_FEED',
+  extra?: { coin?: string; interval?: '1m' | '5m' | '15m' | '1h' | '4h'; reason?: string }
+): Promise<{ ok: boolean; error?: string; snapshot?: EngineStateSnapshot }> {
+  if (!hasConfiguredBackendForApk()) return { ok: false, error: 'Sin servidor backend configurado' };
+  const res = await fetch(buildBackendApiUrl('/api/engine/control'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ action, ...(extra || {}) }),
+  });
+  return parseJsonSafe(res);
+}
+
+export async function pushEngineConfig(
+  config: Partial<BotConfigData>,
+  apiPrivateKey?: string
+): Promise<{ ok: boolean; snapshot?: EngineStateSnapshot }> {
+  if (!hasConfiguredBackendForApk()) return { ok: false };
+  const res = await fetch(buildBackendApiUrl('/api/engine/config'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ config, apiPrivateKey }),
+  });
+  return parseJsonSafe(res);
+}
+
+export async function testMcloudConnection(mcloudUrl?: string): Promise<{
+  ok: boolean;
+  baseUrl: string;
+  healthStatus: number;
+  healthLatencyMs: number;
+  contextStatus: number;
+  contextLatencyMs: number;
+  webhookStatus: number;
+  webhookLatencyMs: number;
+  hmacConfigured: boolean;
+  detail: string;
+}> {
+  const res = await fetch(buildBackendApiUrl('/api/mcloud/test'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ mcloudUrl }),
+  });
+  return parseJsonSafe(res);
+}
+
+const shouldUseBackendProxy = () => hasConfiguredBackendForApk();
+
+let lastDirectRttMs = 0;
+let lastProxyRttMs = 0;
+let directExchangeHealthy = true;
+
+export function getActiveExecutionRoute(): HlExecutionRoute {
+  if (shouldUseBackendProxy()) {
+    return 'TUG777-ENGINE';
+  }
+  return directExchangeHealthy ? 'HL-DIRECT-L1' : 'HL-EXCHANGE-L1';
+}
+
+async function fetchDirectHlInfo<T>(network: HlNetwork, payload: Record<string, unknown>, timeoutMs = 4000) {
+  const t0 = performance.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch('/api/hl/info', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ network, payload }),
-    });
-    const json = await parseJsonSafe<{ data: T; latencyMs: number; channel: string; error?: string }>(res);
-    if (!res.ok) {
-      throw new Error(json?.error || `Hyperliquid HTTP ${res.status}`);
-    }
-    return json;
-  } catch {
-    // Direct Hyperliquid L1 fallback (Hyperliquid /info supports CORS Access-Control-Allow-Origin: *)
-    const t0 = performance.now();
     const directRes = await fetch(`${HL_DIRECT_BASE[network]}/info`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
+      signal: controller.signal,
     });
     if (!directRes.ok) {
       const errText = await directRes.text();
       throw new Error(`Hyperliquid Direct HTTP ${directRes.status}: ${errText.slice(0, 200)}`);
     }
     const data = await parseJsonSafe<T>(directRes);
+    const latencyMs = Math.round(performance.now() - t0);
+    lastDirectRttMs = latencyMs;
     return {
       data,
-      latencyMs: Math.round(performance.now() - t0),
+      latencyMs,
       channel: 'HL-DIRECT-L1',
     };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchProxyHlInfo<T>(network: HlNetwork, payload: Record<string, unknown>, timeoutMs = 5000) {
+  const t0 = performance.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(buildBackendApiUrl('/api/hl/info'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ network, payload }),
+      signal: controller.signal,
+    });
+    const json = await parseJsonSafe<{ data: T; latencyMs: number; channel: string; error?: string }>(res);
+    if (!res.ok) {
+      throw new Error(json?.error || `Hyperliquid HTTP ${res.status}`);
+    }
+    const totalMs = Math.round(performance.now() - t0);
+    lastProxyRttMs = totalMs;
+    return {
+      ...json,
+      latencyMs: Math.min(totalMs, json.latencyMs || totalMs),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function formatHlRaceError(err: unknown): Error {
+  if (typeof AggregateError !== 'undefined' && err instanceof AggregateError) {
+    const msgs = err.errors
+      .map((e) => (e instanceof Error ? e.message : String(e)))
+      .filter(Boolean);
+    return new Error(msgs.length > 0 ? msgs.join(' | ') : 'Hyperliquid no respondió');
+  }
+  return err instanceof Error ? err : new Error(String(err));
+}
+
+export async function hlInfoRequest<T = unknown>(
+  network: HlNetwork,
+  payload: Record<string, unknown>
+): Promise<{ data: T; latencyMs: number; channel: string }> {
+  if (shouldUseBackendProxy()) {
+    try {
+      return await Promise.any([
+        fetchDirectHlInfo<T>(network, payload, 4000),
+        fetchProxyHlInfo<T>(network, payload, 5000),
+      ]);
+    } catch (firstErr) {
+      await new Promise((r) => setTimeout(r, 250));
+      try {
+        return await fetchProxyHlInfo<T>(network, payload, 5000);
+      } catch {
+        throw formatHlRaceError(firstErr);
+      }
+    }
+  }
+  try {
+    return await fetchDirectHlInfo<T>(network, payload, 4500);
+  } catch (err) {
+    await new Promise((r) => setTimeout(r, 250));
+    try {
+      return await fetchDirectHlInfo<T>(network, payload, 4500);
+    } catch {
+      throw formatHlRaceError(err);
+    }
   }
 }
 
 export async function fetchMevAndLatencyProbe(network: HlNetwork): Promise<MevProbeStatus> {
-  try {
-    const res = await fetch(`/api/mev/probe?network=${network}`, {
-      headers: { Accept: 'application/json' },
-    });
-    const json = await parseJsonSafe<MevProbeStatus & { error?: string }>(res);
-    if (!res.ok) {
-      throw new Error(json?.error || 'Error verificando canales RPC');
+  if (shouldUseBackendProxy()) {
+    try {
+      const res = await fetch(buildBackendApiUrl(`/api/mev/probe?network=${network}`), {
+        headers: { Accept: 'application/json' },
+      });
+      const json = await parseJsonSafe<MevProbeStatus & { error?: string }>(res);
+      if (!res.ok) {
+        throw new Error(json?.error || 'Error verificando canales RPC');
+      }
+      return json;
+    } catch {
+      // Fall through to direct HL probes
     }
-    return json;
-  } catch {
+  }
+  {
     const hlBase = HL_DIRECT_BASE[network];
-    const probeDirect = async (name: string, url: string, body: unknown) => {
+    const probeDirect = async (
+      id: string,
+      name: string,
+      scope: 'HYPERLIQUID_INFO',
+      url: string,
+      body: unknown
+    ) => {
       const t0 = performance.now();
       try {
         const r = await fetch(url, {
@@ -81,100 +401,51 @@ export async function fetchMevAndLatencyProbe(network: HlNetwork): Promise<MevPr
           body: JSON.stringify(body),
         });
         const rtt = Math.round(performance.now() - t0);
-        if (!r.ok) return { name, ok: false, latencyMs: rtt, detail: `HTTP ${r.status}` };
-        const json = await parseJsonSafe<{ result?: string }>(r);
-        return { name, ok: true, latencyMs: rtt, detail: json?.result || 'OK' };
+        if (!r.ok) return { id, name, scope, ok: false, latencyMs: rtt, detail: `HTTP ${r.status}` };
+        await r.json();
+        return {
+          id,
+          name,
+          scope,
+          ok: true,
+          latencyMs: rtt,
+          detail: 'OK',
+        };
       } catch (e) {
-        return { name, ok: false, latencyMs: Math.round(performance.now() - t0), detail: String(e) };
+        return { id, name, scope, ok: false, latencyMs: Math.round(performance.now() - t0), detail: String(e) };
       }
     };
 
-    const [hl1, hl2, flashbots] = await Promise.all([
-      probeDirect('Hyperliquid L1 Primary', `${hlBase}/info`, { type: 'meta' }),
-      probeDirect('Hyperliquid L1 Backup Pool', `${hlBase}/info`, { type: 'allMids' }),
-      probeDirect('Flashbots Protect RPC', 'https://rpc.flashbots.net', {
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'eth_blockNumber',
-        params: [],
-      }),
+    const [hlMeta, hlMids] = await Promise.all([
+      probeDirect('hl_info_meta', 'HL Info (Meta)', 'HYPERLIQUID_INFO', `${hlBase}/info`, { type: 'meta' }),
+      probeDirect('hl_info_mids', 'HL Info (Mids)', 'HYPERLIQUID_INFO', `${hlBase}/info`, { type: 'allMids' }),
     ]);
 
     return {
-      channels: [hl1, hl2, flashbots],
-      bestHlLatencyMs: Math.min(hl1.latencyMs, hl2.latencyMs),
-      flashbotsBlockHex: flashbots.ok ? String(flashbots.detail) : null,
+      channels: [hlMeta, hlMids],
+      bestHlLatencyMs: Math.min(hlMeta.latencyMs, hlMids.latencyMs),
+      wsConnected: false,
       checkedAt: Date.now(),
     };
   }
 }
 
-export function computeQuantConfluence(raw: {
-  change24hPct: number;
-  annualizedFundingPct: number;
-  openInterestUsd: number;
-  dayNtlVlm: number;
-  markPx: number;
-  oraclePx: number;
-}): { quantScore: number; quantBias: 'LONG' | 'SHORT' | 'NEUTRAL'; quantSignals: string[] } {
-  const signals: string[] = [];
-  let bullPts = 0;
-  let bearPts = 0;
-
-  // 1. Institutional Liquidity Turnover (Volume / OI)
-  const turnover = raw.openInterestUsd > 0 ? raw.dayNtlVlm / raw.openInterestUsd : 0;
-  if (turnover > 2.5) {
-    signals.push('Alta rotación OI/Vol');
-    bullPts += 12;
-    bearPts += 12;
+export async function fetchAllMids(network: HlNetwork): Promise<{
+  mids: Record<string, number>;
+  latencyMs: number;
+  channel: string;
+}> {
+  const { data, latencyMs, channel } = await hlInfoRequest<Record<string, string>>(network, {
+    type: 'allMids',
+  });
+  const mids: Record<string, number> = {};
+  if (data && typeof data === 'object') {
+    for (const [k, v] of Object.entries(data)) {
+      const n = Number(v);
+      if (Number.isFinite(n) && n > 0) mids[k] = n;
+    }
   }
-
-  // 2. Momentum Confluence (Trend-following, never flip extended trends into contrarian fades)
-  if (raw.change24hPct >= 2.0 && raw.change24hPct <= 14) {
-    signals.push(`Momentum alcista +${raw.change24hPct.toFixed(1)}%`);
-    bullPts += 28;
-  } else if (raw.change24hPct <= -2.0 && raw.change24hPct >= -14) {
-    signals.push(`Momentum bajista ${raw.change24hPct.toFixed(1)}%`);
-    bearPts += 28;
-  } else if (raw.change24hPct > 18) {
-    signals.push(`Tendencia fuerte extendida (+${raw.change24hPct.toFixed(1)}%)`);
-    bullPts += 10;
-  } else if (raw.change24hPct < -18) {
-    signals.push(`Tendencia bajista extendida (${raw.change24hPct.toFixed(1)}%)`);
-    bearPts += 10;
-  }
-
-  // 3. Funding Rate Carry / Positioning Alignment
-  if (raw.annualizedFundingPct <= -25) {
-    signals.push(`Short Squeeze Funding (${raw.annualizedFundingPct.toFixed(0)}% APR)`);
-    bullPts += 18;
-  } else if (raw.annualizedFundingPct >= 65) {
-    signals.push(`Funding muy cargado (${raw.annualizedFundingPct.toFixed(0)}% APR)`);
-    bearPts += 12;
-  }
-
-  // 4. Mark vs Oracle Basis
-  const basisBps = raw.oraclePx > 0 ? ((raw.markPx - raw.oraclePx) / raw.oraclePx) * 10000 : 0;
-  if (basisBps > 8) {
-    signals.push('Prima Mark > Oracle');
-    bullPts += 10;
-  } else if (basisBps < -8) {
-    signals.push('Descuento Mark < Oracle');
-    bearPts += 10;
-  }
-
-  // 5. Minimum institutional liquidity filter
-  if (raw.dayNtlVlm > 5_000_000) {
-    bullPts += 14;
-    bearPts += 14;
-    signals.push('Liquidez Profunda >$5M');
-  }
-
-  const net = bullPts - bearPts;
-  const quantScore = Math.min(98, Math.max(bullPts, bearPts));
-  if (net >= 16) return { quantScore, quantBias: 'LONG', quantSignals: signals };
-  if (net <= -16) return { quantScore, quantBias: 'SHORT', quantSignals: signals };
-  return { quantScore: Math.round(quantScore * 0.7), quantBias: 'NEUTRAL', quantSignals: signals };
+  return { mids, latencyMs, channel };
 }
 
 export async function fetchAllHyperliquidMarkets(network: HlNetwork): Promise<{
@@ -364,16 +635,36 @@ export async function fetchClearinghouseState(
     }>;
   };
 
-  const { data } = await hlInfoRequest<ClearinghouseResp>(network, {
-    type: 'clearinghouseState',
-    user: userAddress,
-  });
+  type OpenOrderResp = Array<{ coin: string; oid: number; cloid?: string }>;
+
+  const [chRes, openRes] = await Promise.all([
+    hlInfoRequest<ClearinghouseResp>(network, {
+      type: 'clearinghouseState',
+      user: userAddress,
+    }),
+    hlInfoRequest<OpenOrderResp>(network, {
+      type: 'openOrders',
+      user: userAddress,
+    }).catch(() => ({ data: [] as OpenOrderResp })),
+  ]);
+
+  const data = chRes.data;
+  const openCloidsByCoin = new Map<string, string[]>();
+  for (const oo of openRes.data || []) {
+    if (oo.cloid) {
+      const arr = openCloidsByCoin.get(oo.coin) || [];
+      arr.push(oo.cloid);
+      openCloidsByCoin.set(oo.coin, arr);
+    }
+  }
 
   const positions = (data?.assetPositions || [])
     .map((ap) => ap.position)
     .filter((p) => Math.abs(Number(p.szi)) > 0)
     .map((p) => {
       const szi = Number(p.szi);
+      const cloids = openCloidsByCoin.get(p.coin) || [];
+      const tugCloid = cloids.find((c) => c.toLowerCase().startsWith(TUG777_CLOID_PREFIX));
       return {
         coin: p.coin,
         szi,
@@ -386,6 +677,7 @@ export async function fetchClearinghouseState(
         liquidationPx: p.liquidationPx ? Number(p.liquidationPx) : null,
         marginUsed: Number(p.marginUsed || 0),
         maxLeverage: p.maxLeverage,
+        ...(tugCloid ? { cloid: tugCloid } : {}),
       };
     });
 
@@ -409,12 +701,13 @@ export async function fetchUserFills(network: HlNetwork, userAddress: string): P
     fee: string;
     oid: number;
     hash: string;
+    cloid?: string;
   };
   const { data } = await hlInfoRequest<RawFill[]>(network, {
     type: 'userFills',
     user: userAddress,
   });
-  return (data || []).slice(0, 60).map((f) => ({
+  return (data || []).slice(0, 120).map((f) => ({
     coin: f.coin,
     px: Number(f.px),
     sz: Number(f.sz),
@@ -424,10 +717,10 @@ export async function fetchUserFills(network: HlNetwork, userAddress: string): P
     fee: Number(f.fee || 0),
     oid: f.oid,
     hash: f.hash,
+    ...(f.cloid ? { cloid: f.cloid } : {}),
   }));
 }
 
-// Hyperliquid 5-sig-fig price formatting rule
 export function formatHlPrice(price: number, szDecimals: number): string {
   if (!Number.isFinite(price) || price <= 0) return '0';
   const maxDecimals = Math.max(0, 6 - szDecimals);
@@ -444,9 +737,10 @@ export function formatHlSize(size: number, szDecimals: number, isReduceOnly = fa
   return rounded.toFixed(szDecimals).replace(/\.?0+$/, '') || '0';
 }
 
-// Anti-MEV / Flashbots Guard Verification before any order submission
 export function evaluateMevShield(params: {
   enabled: boolean;
+  side?: 'LONG' | 'SHORT';
+  executionRoute?: HlExecutionRoute;
   markPx: number;
   oraclePx: number;
   bids: HlL2Level[];
@@ -454,16 +748,51 @@ export function evaluateMevShield(params: {
   notionalUsd: number;
   maxSlippageBps: number;
   maxOracleDeviationBps: number;
-}): { passed: boolean; spreadBps: number; oracleDiffBps: number; topDepthUsd: number; reason: string } {
-  const bestBid = params.bids[0]?.px ?? params.markPx;
-  const bestAsk = params.asks[0]?.px ?? params.markPx;
+}): {
+  passed: boolean;
+  spreadBps: number;
+  oracleDiffBps: number;
+  topDepthUsd: number;
+  directionalDepthUsd: number;
+  estimatedImpactBps: number;
+  executionRoute: HlExecutionRoute;
+  reason: string;
+} {
+  const executionRoute = params.executionRoute ?? getActiveExecutionRoute();
+  const hasBids = params.bids.length > 0 && params.bids[0].px > 0;
+  const hasAsks = params.asks.length > 0 && params.asks[0].px > 0;
+  const bestBid = hasBids ? params.bids[0].px : params.markPx;
+  const bestAsk = hasAsks ? params.asks[0].px : params.markPx;
   const mid = (bestBid + bestAsk) / 2 || params.markPx;
   const spreadBps = mid > 0 ? ((bestAsk - bestBid) / mid) * 10000 : 0;
   const oracleDiffBps = params.oraclePx > 0 ? (Math.abs(params.markPx - params.oraclePx) / params.oraclePx) * 10000 : 0;
 
   const top3BidUsd = params.bids.slice(0, 3).reduce((acc, l) => acc + l.px * l.sz, 0);
   const top3AskUsd = params.asks.slice(0, 3).reduce((acc, l) => acc + l.px * l.sz, 0);
-  const topDepthUsd = Math.min(top3BidUsd || params.notionalUsd, top3AskUsd || params.notionalUsd);
+  const topDepthUsd = hasBids && hasAsks ? Math.min(top3BidUsd, top3AskUsd) : 0;
+  const directionalLevels = params.side === 'LONG' ? params.asks : params.side === 'SHORT' ? params.bids : null;
+  const directionalDepthUsd =
+    params.side === 'LONG' ? top3AskUsd : params.side === 'SHORT' ? top3BidUsd : topDepthUsd;
+
+  let estimatedImpactBps = spreadBps / 2;
+  if (directionalLevels && directionalLevels.length > 0 && params.notionalUsd > 0 && mid > 0) {
+    let remainingUsd = params.notionalUsd;
+    let totalCostUsd = 0;
+    let totalCoins = 0;
+    for (const lvl of directionalLevels) {
+      const lvlUsd = lvl.px * lvl.sz;
+      if (lvlUsd <= 0) continue;
+      const takeUsd = Math.min(remainingUsd, lvlUsd);
+      totalCostUsd += takeUsd;
+      totalCoins += takeUsd / lvl.px;
+      remainingUsd -= takeUsd;
+      if (remainingUsd <= 0.01) break;
+    }
+    if (totalCoins > 0) {
+      const vwap = totalCostUsd / totalCoins;
+      estimatedImpactBps = (Math.abs(vwap - mid) / mid) * 10000;
+    }
+  }
 
   if (!params.enabled) {
     return {
@@ -471,7 +800,23 @@ export function evaluateMevShield(params: {
       spreadBps,
       oracleDiffBps,
       topDepthUsd,
-      reason: 'Escudo MEV desactivado manualmente',
+      directionalDepthUsd,
+      estimatedImpactBps,
+      executionRoute,
+      reason: `Escudo MEV desactivado manualmente (ruta ${executionRoute})`,
+    };
+  }
+
+  if (!hasBids || !hasAsks || bestAsk <= bestBid) {
+    return {
+      passed: false,
+      spreadBps,
+      oracleDiffBps,
+      topDepthUsd,
+      directionalDepthUsd,
+      estimatedImpactBps,
+      executionRoute,
+      reason: `Libro L2 inválido o vacío en ruta ${executionRoute} (Bid ${bestBid} / Ask ${bestAsk}).`,
     };
   }
 
@@ -481,7 +826,10 @@ export function evaluateMevShield(params: {
       spreadBps,
       oracleDiffBps,
       topDepthUsd,
-      reason: `Spread ${spreadBps.toFixed(1)} bps excede límite anti-sandwich (${params.maxSlippageBps} bps).`,
+      directionalDepthUsd,
+      estimatedImpactBps,
+      executionRoute,
+      reason: `[${executionRoute}] Spread ${spreadBps.toFixed(1)} bps excede límite anti-sandwich (${params.maxSlippageBps} bps).`,
     };
   }
 
@@ -491,7 +839,37 @@ export function evaluateMevShield(params: {
       spreadBps,
       oracleDiffBps,
       topDepthUsd,
-      reason: `Desviación Mark/Oracle ${oracleDiffBps.toFixed(1)} bps excede escudo (${params.maxOracleDeviationBps} bps).`,
+      directionalDepthUsd,
+      estimatedImpactBps,
+      executionRoute,
+      reason: `[${executionRoute}] Desviación Mark/Oracle ${oracleDiffBps.toFixed(1)} bps excede escudo (${params.maxOracleDeviationBps} bps).`,
+    };
+  }
+
+  const minRequiredDepth = Math.max(params.notionalUsd * 0.75, 10);
+  if (params.notionalUsd > 0 && directionalDepthUsd < minRequiredDepth) {
+    return {
+      passed: false,
+      spreadBps,
+      oracleDiffBps,
+      topDepthUsd,
+      directionalDepthUsd,
+      estimatedImpactBps,
+      executionRoute,
+      reason: `[${executionRoute}] Liquidez L2 insuficiente ($${directionalDepthUsd.toFixed(0)} < $${minRequiredDepth.toFixed(0)} requeridos).`,
+    };
+  }
+
+  if (estimatedImpactBps > params.maxSlippageBps) {
+    return {
+      passed: false,
+      spreadBps,
+      oracleDiffBps,
+      topDepthUsd,
+      directionalDepthUsd,
+      estimatedImpactBps,
+      executionRoute,
+      reason: `[${executionRoute}] Impacto L2 estimado ${estimatedImpactBps.toFixed(1)} bps excede límite (${params.maxSlippageBps} bps).`,
     };
   }
 
@@ -500,11 +878,74 @@ export function evaluateMevShield(params: {
     spreadBps,
     oracleDiffBps,
     topDepthUsd,
-    reason: `Verificado · Spread ${spreadBps.toFixed(1)} bps · Oracle Δ ${oracleDiffBps.toFixed(1)} bps`,
+    directionalDepthUsd,
+    estimatedImpactBps,
+    executionRoute,
+    reason: `[${executionRoute}] Protegido · Spread ${spreadBps.toFixed(1)} bps · Impacto ${estimatedImpactBps.toFixed(1)} bps · Oracle Δ ${oracleDiffBps.toFixed(1)} bps · L2 $${directionalDepthUsd.toFixed(0)}`,
   };
 }
 
-// Real EIP-712 + MsgPack L1 Action Signer for Hyperliquid API Wallet
+export function auditMevShieldFilters(params: {
+  enabled: boolean;
+  executionRoute?: HlExecutionRoute;
+  markPx: number;
+  oraclePx: number;
+  bids: HlL2Level[];
+  asks: HlL2Level[];
+  notionalUsd: number;
+  maxSlippageBps: number;
+  maxOracleDeviationBps: number;
+}): MevFilterAudit {
+  const longCheck = evaluateMevShield({ ...params, side: 'LONG' });
+  const shortCheck = evaluateMevShield({ ...params, side: 'SHORT' });
+
+  const bestBid = params.bids[0]?.px ?? 0;
+  const bestAsk = params.asks[0]?.px ?? 0;
+  const bookSanityOk = params.bids.length > 0 && params.asks.length > 0 && bestAsk > bestBid;
+  const spreadGuardOk = params.enabled && longCheck.spreadBps <= params.maxSlippageBps;
+  const oracleGuardOk = params.enabled && params.oraclePx > 0 && longCheck.oracleDiffBps <= params.maxOracleDeviationBps;
+  const minDepth = Math.max(params.notionalUsd * 0.75, 10);
+  const depthGuardOk =
+    params.enabled && longCheck.directionalDepthUsd >= minDepth && shortCheck.directionalDepthUsd >= minDepth;
+
+  const passedCount = [bookSanityOk, spreadGuardOk, oracleGuardOk, depthGuardOk].filter(Boolean).length;
+  const summary = !params.enabled
+    ? 'Escudo MEV APAGADO: exposición sin filtro anti-sandwich.'
+    : `Auditoría ${passedCount}/4 filtros OK · Spread ${longCheck.spreadBps.toFixed(1)}bps/${params.maxSlippageBps} · OracleΔ ${longCheck.oracleDiffBps.toFixed(1)}bps/${params.maxOracleDeviationBps} · L2 $${Math.min(longCheck.directionalDepthUsd, shortCheck.directionalDepthUsd).toFixed(0)}`;
+
+  return {
+    spreadGuardOk,
+    oracleGuardOk,
+    depthGuardOk,
+    bookSanityOk,
+    lastAuditAtMs: Date.now(),
+    summary,
+  };
+}
+
+let lastHlOrderNonce = 0;
+
+function nextMonotonicHlNonce(): number {
+  let persisted = 0;
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      persisted = Number(window.sessionStorage.getItem('tug777_last_hl_nonce') || '0');
+    }
+  } catch {
+    persisted = 0;
+  }
+  const base = Math.max(Date.now(), lastHlOrderNonce + 1, Number.isFinite(persisted) ? persisted + 1 : 0);
+  lastHlOrderNonce = base;
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      window.sessionStorage.setItem('tug777_last_hl_nonce', String(base));
+    }
+  } catch {
+    // ignore storage limits
+  }
+  return base;
+}
+
 export async function executeRealHyperliquidOrder(params: {
   network: HlNetwork;
   apiPrivateKey: string;
@@ -515,34 +956,85 @@ export async function executeRealHyperliquidOrder(params: {
   sizeCoins: number;
   slippageBps: number;
   reduceOnly?: boolean;
+  useAlo?: boolean;
+  nativeTpsl?: { slPct: number; tpPct: number };
 }) {
   const wallet = new Wallet(params.apiPrivateKey.trim());
-  const slipFactor = params.isBuy
-    ? 1 + params.slippageBps / 10000
-    : Math.max(0.05, 1 - params.slippageBps / 10000);
+  // Clamp IOC slippage strictly to 100-150 bps (1.0% - 1.5%)
+  const clampedSlipBps = Math.max(100, Math.min(150, Math.round(params.slippageBps || 120)));
+  const useAlo = Boolean(params.useAlo) && !params.reduceOnly;
+  const slipFactor = useAlo
+    ? params.isBuy
+      ? 0.9994
+      : 1.0006
+    : params.isBuy
+    ? 1 + clampedSlipBps / 10000
+    : Math.max(0.05, 1 - clampedSlipBps / 10000);
+
   const limitPxStr = formatHlPrice(params.referencePx * slipFactor, params.szDecimals);
   const sizeStr = formatHlSize(params.sizeCoins, params.szDecimals, Boolean(params.reduceOnly));
+  const sizeNum = Number(sizeStr);
+  const notionalUsd = sizeNum * params.referencePx;
 
-  if (Number(sizeStr) <= 0) {
+  if (sizeNum <= 0) {
     throw new Error('Tamaño de orden demasiado pequeño tras redondeo de decimales Hyperliquid.');
+  }
+  if (!params.reduceOnly && notionalUsd < 10.0) {
+    throw new Error(
+      `Validación pre-envío abortada antes de /exchange: nocional $${notionalUsd.toFixed(2)} < mínimo $10.0 USD Hyperliquid.`
+    );
+  }
+
+  const entryCloid = generateTugClientCloid();
+  const orders: Array<Record<string, unknown>> = [
+    {
+      a: params.assetIndex,
+      b: params.isBuy,
+      p: limitPxStr,
+      s: sizeStr,
+      r: Boolean(params.reduceOnly),
+      t: { limit: { tif: useAlo ? 'Alo' : 'Ioc' } },
+      c: entryCloid,
+    },
+  ];
+
+  let grouping: 'na' | 'normalTpsl' = 'na';
+  if (!params.reduceOnly && params.nativeTpsl && params.nativeTpsl.slPct > 0 && params.nativeTpsl.tpPct > 0) {
+    grouping = 'normalTpsl';
+    const slFrac = Math.max(0.001, params.nativeTpsl.slPct / 100);
+    const tpFrac = Math.max(0.002, params.nativeTpsl.tpPct / 100);
+    const slTrig = params.isBuy ? params.referencePx * (1 - slFrac) : params.referencePx * (1 + slFrac);
+    const slLim = params.isBuy ? slTrig * 0.985 : slTrig * 1.015;
+    const tpTrig = params.isBuy ? params.referencePx * (1 + tpFrac) : params.referencePx * (1 - tpFrac);
+    const tpLim = params.isBuy ? tpTrig * 0.99 : tpTrig * 1.01;
+
+    orders.push({
+      a: params.assetIndex,
+      b: !params.isBuy,
+      p: formatHlPrice(slLim, params.szDecimals),
+      s: sizeStr,
+      r: true,
+      t: { trigger: { isMarket: true, triggerPx: formatHlPrice(slTrig, params.szDecimals), tpsl: 'sl' } },
+      c: generateTugClientCloid(),
+    });
+    orders.push({
+      a: params.assetIndex,
+      b: !params.isBuy,
+      p: formatHlPrice(tpLim, params.szDecimals),
+      s: sizeStr,
+      r: true,
+      t: { trigger: { isMarket: true, triggerPx: formatHlPrice(tpTrig, params.szDecimals), tpsl: 'tp' } },
+      c: generateTugClientCloid(),
+    });
   }
 
   const action = {
     type: 'order',
-    orders: [
-      {
-        a: params.assetIndex,
-        b: params.isBuy,
-        p: limitPxStr,
-        s: sizeStr,
-        r: Boolean(params.reduceOnly),
-        t: { limit: { tif: 'Ioc' } },
-      },
-    ],
-    grouping: 'na',
+    orders,
+    grouping,
   };
 
-  const nonce = Date.now();
+  const nonce = nextMonotonicHlNonce();
   const msgPackBytes = encode(action);
   const nonceBytes = new Uint8Array(8);
   const view = new DataView(nonceBytes.buffer);
@@ -567,8 +1059,10 @@ export async function executeRealHyperliquidOrder(params: {
     connectionId,
   };
 
+  const signStartedAt = performance.now();
   const rawSig = await wallet.signTypedData(domain, types, message);
   const sig = Signature.from(rawSig);
+  const signMs = Math.max(1, Math.round(performance.now() - signStartedAt));
 
   const signedPayload = {
     action,
@@ -580,51 +1074,188 @@ export async function executeRealHyperliquidOrder(params: {
     },
   };
 
-  try {
-    const res = await fetch('/api/hl/exchange', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({
-        network: params.network,
-        signedPayload,
-      }),
-    });
-
-    const json = await parseJsonSafe<{ data: unknown; latencyMs: number; channel: string; error?: string }>(res);
-    if (!res.ok) {
-      throw new Error(json?.error || 'Error enviando orden firmada a Hyperliquid');
+  const parseExchangeFillStatus = (
+    exchangeResponse: unknown
+  ): {
+    fillStatus: OrderFillStatus;
+    filledSz: number;
+    filledAvgPx: number;
+    oid: number | null;
+    rejectReason: string;
+  } => {
+    const resp = exchangeResponse as {
+      status?: string;
+      response?: string | { data?: { statuses?: Array<{ error?: string; filled?: { totalSz?: string; avgPx?: string; oid?: number }; resting?: { oid?: number } }> } };
+    } | null;
+    if (!resp || resp.status === 'err') {
+      return {
+        fillStatus: 'REJECTED',
+        filledSz: 0,
+        filledAvgPx: 0,
+        oid: null,
+        rejectReason: String(resp?.response || 'Rechazo Hyperliquid'),
+      };
     }
-
+    const statuses =
+      typeof resp.response === 'object' && resp.response !== null ? resp.response.data?.statuses : undefined;
+    const first = Array.isArray(statuses) ? statuses[0] : undefined;
+    if (first?.error) {
+      return {
+        fillStatus: 'REJECTED',
+        filledSz: 0,
+        filledAvgPx: 0,
+        oid: null,
+        rejectReason: first.error,
+      };
+    }
+    if (first?.filled) {
+      return {
+        fillStatus: 'FILLED',
+        filledSz: Number(first.filled.totalSz || 0),
+        filledAvgPx: Number(first.filled.avgPx || 0),
+        oid: typeof first.filled.oid === 'number' ? first.filled.oid : null,
+        rejectReason: '',
+      };
+    }
+    if (first?.resting) {
+      return {
+        fillStatus: 'RESTING',
+        filledSz: 0,
+        filledAvgPx: 0,
+        oid: typeof first.resting.oid === 'number' ? first.resting.oid : null,
+        rejectReason: '',
+      };
+    }
+    const rawStr = JSON.stringify(exchangeResponse || {});
+    if (rawStr.toLowerCase().includes('"error"')) {
+      return {
+        fillStatus: 'REJECTED',
+        filledSz: 0,
+        filledAvgPx: 0,
+        oid: null,
+        rejectReason: rawStr.slice(0, 180),
+      };
+    }
     return {
-      exchangeResponse: json.data,
-      latencyMs: json.latencyMs,
-      channel: json.channel,
-      agentAddress: wallet.address,
-      limitPxStr,
-      sizeStr,
+      fillStatus: 'ACK_ONLY',
+      filledSz: 0,
+      filledAvgPx: 0,
+      oid: null,
+      rejectReason: '',
     };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (!msg.includes('HTML/no-JSON') && !msg.includes('Failed to fetch')) {
+  };
+
+  const sendViaDirectL1 = async () => {
+    const t0 = performance.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 5500);
+    try {
+      const directRes = await fetch(`${HL_DIRECT_BASE[params.network]}/exchange`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(signedPayload),
+        signal: controller.signal,
+      });
+      const data = await parseJsonSafe(directRes);
+      const directMs = Math.round(performance.now() - t0);
+      if (!directRes.ok) {
+        throw new Error(`Error enviando orden firmada directamente a Hyperliquid (${directRes.status})`);
+      }
+      directExchangeHealthy = true;
+      const parsedFill = parseExchangeFillStatus(data);
+      const fillVerifyMs = parsedFill.fillStatus === 'FILLED' ? directMs : 0;
+      return {
+        exchangeResponse: data,
+        latencyMs: directMs,
+        e2eAckMs: directMs,
+        exchangeRttMs: directMs,
+        signMs,
+        fillVerifyMs,
+        fillStatus: parsedFill.fillStatus,
+        filledSz: parsedFill.filledSz,
+        filledAvgPx: parsedFill.filledAvgPx,
+        oid: parsedFill.oid,
+        cloid: entryCloid,
+        rejectReason: parsedFill.rejectReason,
+        channel: 'HL-DIRECT-L1' as HlExecutionRoute,
+        agentAddress: wallet.address,
+        limitPxStr,
+        sizeStr,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const sendViaProxyRelay = async () => {
+    const e2eStartedAt = performance.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6500);
+    try {
+      const res = await fetch(buildBackendApiUrl('/api/hl/exchange'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          network: params.network,
+          signedPayload,
+        }),
+        signal: controller.signal,
+      });
+
+      const json = await parseJsonSafe<{ data: unknown; latencyMs: number; channel: string; error?: string }>(res);
+      const e2eAckMs = Math.round(performance.now() - e2eStartedAt);
+      if (!res.ok) {
+        throw new Error(json?.error || 'Error enviando orden firmada a Hyperliquid');
+      }
+
+      const parsedFill = parseExchangeFillStatus(json.data);
+      const fillVerifyMs = parsedFill.fillStatus === 'FILLED' ? e2eAckMs : 0;
+
+      return {
+        exchangeResponse: json.data,
+        latencyMs: e2eAckMs,
+        e2eAckMs,
+        exchangeRttMs: json.latencyMs,
+        signMs,
+        fillVerifyMs,
+        fillStatus: parsedFill.fillStatus,
+        filledSz: parsedFill.filledSz,
+        filledAvgPx: parsedFill.filledAvgPx,
+        oid: parsedFill.oid,
+        cloid: entryCloid,
+        rejectReason: parsedFill.rejectReason,
+        channel: 'HL-EXCHANGE-L1' as HlExecutionRoute,
+        agentAddress: wallet.address,
+        limitPxStr,
+        sizeStr,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const preferDirect =
+    !shouldUseBackendProxy() ||
+    directExchangeHealthy ||
+    (lastDirectRttMs > 0 && (lastProxyRttMs === 0 || lastDirectRttMs <= lastProxyRttMs));
+
+  if (preferDirect) {
+    try {
+      return await sendViaDirectL1();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isNetworkOrCors =
+        msg.includes('Failed to fetch') ||
+        msg.includes('NetworkError') ||
+        msg.includes('AbortError') ||
+        msg.includes('aborted');
+      if (isNetworkOrCors && shouldUseBackendProxy()) {
+        directExchangeHealthy = false;
+        return await sendViaProxyRelay();
+      }
       throw err;
     }
-    const t0 = performance.now();
-    const directRes = await fetch(`${HL_DIRECT_BASE[params.network]}/exchange`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(signedPayload),
-    });
-    const data = await parseJsonSafe(directRes);
-    if (!directRes.ok) {
-      throw new Error('Error enviando orden firmada directamente a Hyperliquid');
-    }
-    return {
-      exchangeResponse: data,
-      latencyMs: Math.round(performance.now() - t0),
-      channel: 'HL-DIRECT-L1',
-      agentAddress: wallet.address,
-      limitPxStr,
-      sizeStr,
-    };
   }
+
+  return await sendViaProxyRelay();
 }

@@ -28,6 +28,12 @@ export interface ParsedVoiceCommand {
   rawText: string;
 }
 
+interface AndroidTTSBridge {
+  speak: (text: string, priority: boolean) => void;
+  stop: () => void;
+  isAvailable?: () => boolean;
+}
+
 const SPOKEN_COIN_ALIASES: Record<string, string> = {
   BITCOIN: 'BTC',
   BTC: 'BTC',
@@ -107,12 +113,49 @@ class VoiceAssistantEngine {
   private onStatusCb: ((status: { listening: boolean; transcript?: string; error?: string }) => void) | null = null;
   private knownCoins: string[] = [];
 
+  private cachedVoice: SpeechSynthesisVoice | null = null;
+  private webSpeechPrimed = false;
+  private gestureHooksInstalled = false;
+  private speechQueue: string[] = [];
+  private isWebSpeaking = false;
+  private speakTimer: ReturnType<typeof setTimeout> | null = null;
+  private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastSpokenText = '';
+  private lastSpokenAt = 0;
+
+  constructor() {
+    if (typeof window !== 'undefined') {
+      this.installGestureUnlockers();
+      this.initVoicesListener();
+    }
+  }
+
+  private getAndroidBridge(): AndroidTTSBridge | null {
+    if (typeof window === 'undefined') return null;
+    const bridge = (window as unknown as { AndroidTTS?: AndroidTTSBridge }).AndroidTTS;
+    if (bridge && typeof bridge.speak === 'function') {
+      return bridge;
+    }
+    return null;
+  }
+
+  public hasNativeBridge(): boolean {
+    return this.getAndroidBridge() !== null;
+  }
+
   public setKnownCoins(coins: string[]) {
     this.knownCoins = coins.map((c) => c.toUpperCase());
   }
 
   public isSpeechSynthesisSupported(): boolean {
+    if (this.hasNativeBridge()) return true;
     return typeof window !== 'undefined' && 'speechSynthesis' in window;
+  }
+
+  public getEngineDiagnostic(): 'native_android_tts' | 'web_speech' | 'unsupported' {
+    if (this.hasNativeBridge()) return 'native_android_tts';
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) return 'web_speech';
+    return 'unsupported';
   }
 
   public isSpeechRecognitionSupported(): boolean {
@@ -124,40 +167,239 @@ class VoiceAssistantEngine {
     return Boolean(w.SpeechRecognition || w.webkitSpeechRecognition);
   }
 
-  public speak(text: string, priority = false) {
-    if (!this.voiceEnabled || !this.isSpeechSynthesisSupported() || !text.trim()) return;
+  private initVoicesListener() {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
     try {
       const synth = window.speechSynthesis;
-      if (priority) {
-        synth.cancel();
+      const pickBestSpanishVoice = () => {
+        const voices = synth.getVoices();
+        if (!voices || voices.length === 0) return;
+        this.cachedVoice =
+          voices.find((v) => v.lang.toLowerCase().startsWith('es-mx')) ||
+          voices.find((v) => v.lang.toLowerCase().startsWith('es-us')) ||
+          voices.find((v) => v.lang.toLowerCase().startsWith('es-es')) ||
+          voices.find((v) => v.lang.toLowerCase().startsWith('es')) ||
+          null;
+      };
+      pickBestSpanishVoice();
+      if (typeof synth.addEventListener === 'function') {
+        synth.addEventListener('voiceschanged', pickBestSpanishVoice);
+      } else {
+        synth.onvoiceschanged = pickBestSpanishVoice;
       }
-      const clean = text
-        .replace(/[*_`#]/g, '')
-        .replace(/\$/g, ' dólares ')
-        .replace(/%/g, ' por ciento ')
-        .trim();
+    } catch {
+      // Ignore browser voices initialization failure
+    }
+  }
 
-      const utter = new SpeechSynthesisUtterance(clean);
-      utter.lang = 'es-MX';
-      utter.rate = 1.06;
-      utter.pitch = 0.94;
+  private installGestureUnlockers() {
+    if (this.gestureHooksInstalled || typeof document === 'undefined') return;
+    this.gestureHooksInstalled = true;
+    const onFirstGesture = () => {
+      this.unlockFromUserGesture();
+    };
+    document.addEventListener('pointerdown', onFirstGesture, { passive: true, capture: true });
+    document.addEventListener('touchstart', onFirstGesture, { passive: true, capture: true });
+    document.addEventListener('click', onFirstGesture, { passive: true, capture: true });
+    document.addEventListener('keydown', onFirstGesture, { passive: true, capture: true });
+  }
 
-      const voices = synth.getVoices();
-      const esVoice =
-        voices.find((v) => v.lang.toLowerCase().startsWith('es-mx')) ||
-        voices.find((v) => v.lang.toLowerCase().startsWith('es-us')) ||
-        voices.find((v) => v.lang.toLowerCase().startsWith('es'));
-      if (esVoice) utter.voice = esVoice;
+  /**
+   * Unlocks Web Speech API inside deployed mobile Chrome / iOS Safari / PWAs
+   * where async timer speech is blocked until primed within a user gesture.
+   */
+  public unlockFromUserGesture() {
+    if (this.hasNativeBridge()) return;
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    try {
+      const synth = window.speechSynthesis;
+      if (synth.paused) synth.resume();
+      if (this.webSpeechPrimed) return;
+      this.webSpeechPrimed = true;
+      const silent = new SpeechSynthesisUtterance(' ');
+      silent.lang = 'es-MX';
+      silent.volume = 0;
+      silent.rate = 10;
+      synth.speak(silent);
+    } catch {
+      // Ignore unlock errors
+    }
+  }
+
+  private sanitizeForSpeech(text: string): string {
+    return text
+      .replace(/[*_`#|[\]]/g, ' ')
+      .replace(/→/g, ' hacia ')
+      .replace(/≥/g, ' mayor o igual a ')
+      .replace(/<=?/g, ' menor o igual a ')
+      .replace(/\$(\d)/g, '$1 dólares ')
+      .replace(/\$/g, ' dólares ')
+      .replace(/%/g, ' por ciento ')
+      .replace(/\bSL\b/g, ' stop loss ')
+      .replace(/\bTP\b/g, ' take profit ')
+      .replace(/\bPnL\b/gi, ' P N L ')
+      .replace(/\bMEV\b/g, ' M E V ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  private clearWatchdog() {
+    if (this.watchdogTimer) {
+      clearTimeout(this.watchdogTimer);
+      this.watchdogTimer = null;
+    }
+  }
+
+  private flushWebQueue() {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    if (this.isWebSpeaking || this.speechQueue.length === 0) return;
+
+    const nextText = this.speechQueue.shift();
+    if (!nextText) return;
+
+    try {
+      const synth = window.speechSynthesis;
+      if (synth.paused) synth.resume();
+
+      const utter = new SpeechSynthesisUtterance(nextText);
+      utter.lang = this.cachedVoice?.lang || 'es-MX';
+      utter.rate = 1.05;
+      utter.pitch = 0.95;
+      utter.volume = 1.0;
+
+      if (!this.cachedVoice) {
+        const voices = synth.getVoices();
+        this.cachedVoice =
+          voices.find((v) => v.lang.toLowerCase().startsWith('es-mx')) ||
+          voices.find((v) => v.lang.toLowerCase().startsWith('es-us')) ||
+          voices.find((v) => v.lang.toLowerCase().startsWith('es')) ||
+          null;
+      }
+      if (this.cachedVoice) {
+        utter.voice = this.cachedVoice;
+      }
+
+      this.isWebSpeaking = true;
+      const finishCurrent = () => {
+        this.clearWatchdog();
+        this.isWebSpeaking = false;
+        if (this.speechQueue.length > 0 && this.voiceEnabled) {
+          setTimeout(() => this.flushWebQueue(), 40);
+        }
+      };
+
+      utter.onend = finishCurrent;
+      utter.onerror = finishCurrent;
+
+      // Guard against Chromium wedged speechSynthesis (never fires onend after sleep/tab switch)
+      this.clearWatchdog();
+      this.watchdogTimer = setTimeout(() => {
+        try {
+          synth.cancel();
+        } catch {
+          // ignore
+        }
+        finishCurrent();
+      }, 12000);
 
       synth.speak(utter);
+    } catch {
+      this.clearWatchdog();
+      this.isWebSpeaking = false;
+    }
+  }
+
+  public speak(text: string, priority = false) {
+    if (!this.voiceEnabled || !text.trim()) return;
+    const clean = this.sanitizeForSpeech(text);
+    if (!clean) return;
+
+    const now = Date.now();
+    if (!priority && clean === this.lastSpokenText && now - this.lastSpokenAt < 4000) {
+      return;
+    }
+    this.lastSpokenText = clean;
+    this.lastSpokenAt = now;
+
+    // Tier 1: Native Android TextToSpeech Bridge inside TUG777 APK
+    const androidTts = this.getAndroidBridge();
+    if (androidTts) {
+      try {
+        androidTts.speak(clean, priority);
+        return;
+      } catch {
+        // Fallback to Web Speech if bridge fails
+      }
+    }
+
+    // Tier 2: Hardened Web Speech Synthesis for Browser / Deployed PWA / Mobile Chrome
+    if (typeof window === 'undefined' || !('speechSynthesis' in window)) return;
+    try {
+      const synth = window.speechSynthesis;
+      if (synth.paused) synth.resume();
+
+      if (priority) {
+        this.speechQueue = [clean];
+        this.clearWatchdog();
+        if (this.speakTimer) {
+          clearTimeout(this.speakTimer);
+          this.speakTimer = null;
+        }
+        const wasBusy = synth.speaking || synth.pending || this.isWebSpeaking;
+        if (wasBusy) {
+          synth.cancel();
+        }
+        this.isWebSpeaking = false;
+        // Brief defer after cancel() avoids Chrome dropping the immediately-queued utterance
+        this.speakTimer = setTimeout(() => {
+          this.speakTimer = null;
+          this.flushWebQueue();
+        }, wasBusy ? 45 : 0);
+        return;
+      }
+
+      // Keep queue bounded so autonomous narration always stays fresh
+      if (this.speechQueue.length >= 3) {
+        this.speechQueue = this.speechQueue.slice(-2);
+      }
+      this.speechQueue.push(clean);
+      if (!this.isWebSpeaking && !synth.speaking) {
+        this.flushWebQueue();
+      }
     } catch {
       // Ignore synthesis errors when browser blocks autoplay audio before first interaction
     }
   }
 
+  public testVoice(sampleText = '¡Oye socio! Voz de T U G 777 encendida al cien. El mundo es tuyo, vamos por toda esa plata.') {
+    this.voiceEnabled = true;
+    this.unlockFromUserGesture();
+    this.speak(sampleText, true);
+  }
+
   public stopSpeaking() {
-    if (this.isSpeechSynthesisSupported()) {
-      window.speechSynthesis.cancel();
+    this.speechQueue = [];
+    this.clearWatchdog();
+    if (this.speakTimer) {
+      clearTimeout(this.speakTimer);
+      this.speakTimer = null;
+    }
+    this.isWebSpeaking = false;
+
+    const androidTts = this.getAndroidBridge();
+    if (androidTts) {
+      try {
+        androidTts.stop();
+      } catch {
+        // ignore
+      }
+    }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // ignore
+      }
     }
   }
 
@@ -193,12 +435,10 @@ class VoiceAssistantEngine {
       .normalize('NFD')
       .replace(/[\u0300-\u036f]/g, '');
 
-    // Mute voice
     if (/(silencia|callate|apaga la voz|desactiva la voz|sin voz)/.test(lower)) {
       return { type: 'MUTE_VOICE', rawText };
     }
 
-    // AI Power ON / OFF
     if (/(enciende|activa|prende|inicia).*(ia|inteligencia|motor|bot)/.test(lower)) {
       return { type: 'AI_ON', rawText };
     }
@@ -206,7 +446,6 @@ class VoiceAssistantEngine {
       return { type: 'AI_OFF', rawText };
     }
 
-    // 3 Modes
     if (/modo.*(estrategia\s*(mas|\+|y)\s*ia|combinado|unificado)/.test(lower)) {
       return { type: 'MODE_STRATEGY_AI', rawText };
     }
@@ -217,7 +456,6 @@ class VoiceAssistantEngine {
       return { type: 'MODE_AI', rawText };
     }
 
-    // Close all / Close specific position
     if (/(cierra|cerrar).*(todas|todo|posiciones)/.test(lower)) {
       return { type: 'CLOSE_ALL', rawText };
     }
@@ -226,7 +464,6 @@ class VoiceAssistantEngine {
       if (coin) return { type: 'CLOSE_TRADE', coin, rawText };
     }
 
-    // Open Long / Short position
     if (/(abre|abrir|entra|compra|mete|pon).*(long|largo|compra)/.test(lower) || /^(compra|long)\s+/.test(lower)) {
       const coin = this.extractCoinFromText(upper);
       const notionalUsd = this.extractUsdAmount(lower);
@@ -238,22 +475,18 @@ class VoiceAssistantEngine {
       if (coin) return { type: 'OPEN_TRADE', coin, side: 'SHORT', notionalUsd, rawText };
     }
 
-    // Scan / Analyze
     if (/(analiza|escanea|busca|revisa).*(mercado|oportunidad|senales|ahora)/.test(lower)) {
       return { type: 'ANALYZE_NOW', rawText };
     }
 
-    // Sync positions
     if (/(actualiza|sincroniza|refresca).*(posicion|posiciones|cuenta|hyperliquid)/.test(lower)) {
       return { type: 'SYNC_POSITIONS', rawText };
     }
 
-    // Save config
     if (/(guarda|salva|almacena).*(config|configuracion|ajustes)/.test(lower)) {
       return { type: 'SAVE_CONFIG', rawText };
     }
 
-    // Navigation
     if (/(abre|ve a|ir a|muestra|ver).*(posicion|posiciones)/.test(lower)) {
       return { type: 'NAV_POSITIONS', rawText };
     }
@@ -279,13 +512,11 @@ class VoiceAssistantEngine {
       return { type: 'OPEN_COPILOT', rawText };
     }
 
-    // Select coin chart
     if (/(muestra|ver|pon|selecciona|grafica de)/.test(lower)) {
       const coin = this.extractCoinFromText(upper);
       if (coin) return { type: 'SELECT_COIN', coin, rawText };
     }
 
-    // Default: treat as spoken question/instruction for AI Copilot
     return { type: 'ASK_COPILOT', rawText };
   }
 

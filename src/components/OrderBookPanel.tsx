@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { ShieldCheck, XCircle, Zap } from 'lucide-react';
 import type { HlAssetMarket, HlL2Level } from '../types/trading';
+import { formatSignedUsd } from '../utils/formatters';
 import { soundEngine } from '../utils/soundEngine';
 
 interface OrderBookPanelProps {
@@ -9,12 +10,16 @@ interface OrderBookPanelProps {
   asks: HlL2Level[];
   hasApiKey: boolean;
   mevShieldEnabled: boolean;
+  activeRoute?: string;
   defaultNotionalUsd: number;
   executing: boolean;
+  useAloEntries?: boolean;
+  onToggleAlo?: (useAlo: boolean) => void;
   activePosition?: {
     side: 'LONG' | 'SHORT';
     size: number;
     unrealizedPnl: number;
+    isExternal?: boolean;
   } | null;
   closingActive?: boolean;
   onQuickClose?: () => void;
@@ -28,8 +33,11 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
   asks,
   hasApiKey,
   mevShieldEnabled,
+  activeRoute = 'TUG777-ENGINE',
   defaultNotionalUsd,
   executing,
+  useAloEntries = false,
+  onToggleAlo,
   activePosition,
   closingActive = false,
   onQuickClose,
@@ -50,14 +58,14 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
 
   return (
     <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg flex flex-col">
-      <div className="px-4 py-3 border-b border-slate-800/80 flex items-center justify-between">
-        <div>
-          <h3 className="text-sm font-semibold text-slate-100">Libro L2 y Ejecución</h3>
-          <p className="text-xs text-slate-400">
+      <div className="px-4 py-3 border-b border-slate-800/80 flex items-center justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="text-sm font-semibold text-slate-100 truncate">Libro L2 y Ejecución</h3>
+          <p className="text-xs text-slate-400 truncate">
             Apalancamiento nativo · Max {asset?.maxLeverage ?? 20}x
           </p>
         </div>
-        <span className="font-mono-tabular text-xs text-slate-400">
+        <span className="font-mono-tabular text-xs text-slate-400 whitespace-nowrap shrink-0">
           Spread {spreadBps.toFixed(1)} bps
         </span>
       </div>
@@ -85,11 +93,11 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
       </div>
 
       {/* Spread Divider */}
-      <div className="my-1 px-3 py-1.5 bg-[#090B0E] border-y border-slate-800/80 flex items-center justify-between font-mono-tabular text-xs">
-        <span className="text-amber-400 font-semibold">
+      <div className="my-1 px-3 py-1.5 bg-[#090B0E] border-y border-slate-800/80 flex items-center justify-between font-mono-tabular text-xs gap-2">
+        <span className="text-amber-400 font-semibold truncate">
           Mark ${formatPx(asset?.markPx ?? 0)}
         </span>
-        <span className="text-slate-400">
+        <span className="text-slate-400 truncate">
           Oracle ${formatPx(asset?.oraclePx ?? 0)}
         </span>
       </div>
@@ -114,9 +122,27 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
       {/* Direct Manual Execution */}
       <div className="mt-auto p-4 border-t border-slate-800/80 space-y-3 bg-[#0C1016]">
         <div>
-          <label className="block text-xs text-slate-400 mb-1">
-            Tamaño Nocional (USD) · Apalancamiento por defecto
-          </label>
+          <div className="flex items-center justify-between gap-2 mb-1">
+            <label className="block text-xs text-slate-400 truncate">
+              Nocional (USD) · min $10
+            </label>
+            {onToggleAlo && (
+              <button
+                type="button"
+                onClick={() => {
+                  soundEngine.click();
+                  onToggleAlo(!useAloEntries);
+                }}
+                className={`px-2 py-0.5 rounded text-[10px] font-mono-tabular font-bold border whitespace-nowrap shrink-0 ${
+                  useAloEntries
+                    ? 'bg-sky-500/20 border-sky-500/50 text-sky-300'
+                    : 'bg-slate-800 border-slate-700 text-slate-300'
+                }`}
+              >
+                {useAloEntries ? 'ALO Post-Only' : 'IOC (1.0-1.5%)'}
+              </button>
+            )}
+          </div>
           <div className="flex items-center gap-2">
             <input
               type="number"
@@ -132,19 +158,21 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
                 soundEngine.click();
                 setNotionalUsd('100');
               }}
-              className="px-2.5 py-2 text-xs font-mono-tabular bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md whitespace-nowrap"
+              className="px-2.5 py-2 text-xs font-mono-tabular bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md whitespace-nowrap shrink-0"
             >
               $100
             </button>
           </div>
         </div>
 
-        <div className="flex items-center justify-between text-xs text-slate-400">
-          <span className="inline-flex items-center gap-1.5 text-emerald-400">
-            <ShieldCheck className="w-3.5 h-3.5" />
-            {mevShieldEnabled ? 'Escudo Anti-MEV Activo' : 'Escudo MEV Inactivo'}
+        <div className="flex flex-wrap items-center justify-between gap-1.5 text-xs text-slate-400">
+          <span className="inline-flex items-center gap-1.5 text-emerald-400 min-w-0 truncate">
+            <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+            <span className="truncate">
+              {mevShieldEnabled ? `Escudo MEV (${activeRoute})` : `MEV Off (${activeRoute})`}
+            </span>
           </span>
-          <span className="font-mono-tabular">
+          <span className="font-mono-tabular whitespace-nowrap shrink-0 text-slate-300">
             {asset ? `${(Number(notionalUsd || 0) / asset.markPx).toFixed(4)} ${asset.coin}` : '--'}
           </span>
         </div>
@@ -157,20 +185,22 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
               soundEngine.click();
               onQuickClose();
             }}
-            className="w-full py-2.5 px-3 rounded-md bg-red-600/20 hover:bg-red-600 text-red-200 hover:text-white border border-red-500/50 disabled:opacity-50 text-xs font-bold flex items-center justify-between transition-colors"
+            className="w-full py-2.5 px-3 rounded-md bg-red-600/20 hover:bg-red-600 text-red-200 hover:text-white border border-red-500/50 disabled:opacity-50 text-xs font-bold flex items-center justify-between gap-2 transition-colors"
           >
-            <span className="inline-flex items-center gap-1.5">
-              <XCircle className="w-3.5 h-3.5" />
-              {closingActive
-                ? `Cerrando ${asset?.coin}...`
-                : `Cerrar ${activePosition.side} ${asset?.coin}`}
+            <span className="inline-flex items-center gap-1.5 min-w-0 truncate">
+              <XCircle className="w-3.5 h-3.5 shrink-0" />
+              <span className="truncate">
+                {closingActive
+                  ? `Cerrando ${asset?.coin}...`
+                  : `Cerrar ${activePosition.side} ${asset?.coin}${activePosition.isExternal ? ' [EXT]' : ''}`}
+              </span>
             </span>
             <span
-              className={`font-mono-tabular ${
+              className={`font-mono-tabular shrink-0 ${
                 activePosition.unrealizedPnl >= 0 ? 'text-emerald-300' : 'text-red-300'
               }`}
             >
-              {activePosition.unrealizedPnl >= 0 ? '+' : ''}${activePosition.unrealizedPnl.toFixed(2)}
+              {formatSignedUsd(activePosition.unrealizedPnl)}
             </span>
           </button>
         )}

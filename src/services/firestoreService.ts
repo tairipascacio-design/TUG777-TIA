@@ -3,6 +3,7 @@ import {
   collection,
   doc,
   getDoc,
+  getDocs,
   limit,
   onSnapshot,
   orderBy,
@@ -14,45 +15,102 @@ import {
   type Unsubscribe,
 } from 'firebase/firestore';
 import { OperationType, db, handleFirestoreError } from '../firebase';
+import { memoryFingerprint, positionFingerprint } from './localArchive';
 import type {
   AiMemoryEntry,
+  BiasLockMode,
   BotConfigData,
   ChatMessageEntry,
   PersistedPosition,
   StrategyPlaybookItem,
   TradeLogEntry,
 } from '../types/trading';
-import { DEFAULT_STRATEGY_PLAYBOOK } from './strategyEngine';
+import {
+  DEFAULT_STRATEGY_PLAYBOOK,
+  MIN_ATTRIBUTABLE_TRADES,
+  computeCalibratedStrategyWeight,
+} from './strategyEngine';
 
-const DEFAULT_CONFIG = (uid: string): BotConfigData => ({
+const ATTRIBUTED_TRADE_IDS_KEY = 'tug777_attributed_trade_ids_v1';
+const attributedTradeIdsMem = new Set<string>();
+
+function loadAttributedTradeIds(): Set<string> {
+  if (attributedTradeIdsMem.size > 0) return attributedTradeIdsMem;
+  if (typeof window === 'undefined') return attributedTradeIdsMem;
+  try {
+    const raw = localStorage.getItem(ATTRIBUTED_TRADE_IDS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        for (const id of parsed) {
+          if (typeof id === 'string') attributedTradeIdsMem.add(id);
+        }
+      }
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return attributedTradeIdsMem;
+}
+
+function markTradeIdAttributed(tradeId: string) {
+  const set = loadAttributedTradeIds();
+  set.add(tradeId);
+  if (typeof window === 'undefined') return;
+  try {
+    const trimmed = Array.from(set).slice(-500);
+    localStorage.setItem(ATTRIBUTED_TRADE_IDS_KEY, JSON.stringify(trimmed));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export const DEFAULT_CONFIG = (uid: string): BotConfigData => ({
   ownerId: uid,
   mode: 'strategy_ai',
   aiEnabled: false,
   network: 'mainnet',
   masterWalletAddress: '',
   mevShieldEnabled: true,
-  maxSlippageBps: 25,
-  maxOracleDeviationBps: 45,
+  maxSlippageBps: 15,
+  maxOracleDeviationBps: 35,
   riskPerTradeUsd: 50,
   soundEnabled: true,
   aiProvider: 'gemini',
   customAiUrl: '',
   customAiModel: '',
   customSystemPrompt: '',
-  scanIntervalSec: 180,
-  minConfidence: 68,
-  minQuantScore: 58,
-  minVolumeM: 2,
-  tpPct: 3.0,
-  slPct: 1.4,
+  scanIntervalSec: 45,
+  minConfidence: 65,
+  minQuantScore: 65,
+  minVolumeM: 5,
+  tpPct: 3.5,
+  slPct: 0.85,
   useDeepThinking: false,
   useSearchGrounding: false,
   sizingMode: 'equity_pct',
-  capitalPctPerTrade: 25,
-  maxOpenPositions: 3,
+  capitalPctPerTrade: 15,
+  maxOpenPositions: 2,
   trailingStopEnabled: true,
   autoManagePositions: true,
+  riskPerTradePct: 0.35,
+  dailyMaxLossPct: 2.5,
+  killSwitchEnabled: false,
+  geminiModel: 'auto',
+  globalBiasLock: 'AMBOS',
+  pairBiasLocksJson: '{}',
+  useAloEntries: false,
+  minOrderUsdFloor: 12,
+  streakCooldownHours: 3,
+  watchlistCoinsCsv: 'BTC,ETH,SOL,HYPE',
+  mcloudEnabled: true,
+  mcloudUrl: 'https://mcloud-1036926196544.us-east1.run.app',
 });
+
+function sanitizeBiasLock(val: unknown): BiasLockMode {
+  if (val === 'SOLO_LONG' || val === 'SOLO_SHORT' || val === 'PAUSA') return val;
+  return 'AMBOS';
+}
 
 export async function ensureUserProfileAndConfig(user: {
   uid: string;
@@ -82,8 +140,8 @@ export async function ensureUserProfileAndConfig(user: {
 
   try {
     const cfgSnap = await getDoc(configRef);
+    const defaults = DEFAULT_CONFIG(user.uid);
     if (!cfgSnap.exists()) {
-      const defaults = DEFAULT_CONFIG(user.uid);
       await setDoc(configRef, {
         ...defaults,
         createdAt: serverTimestamp(),
@@ -94,32 +152,50 @@ export async function ensureUserProfileAndConfig(user: {
     const d = cfgSnap.data();
     return {
       ownerId: user.uid,
-      mode: d.mode || 'strategy_ai',
+      mode: d.mode || defaults.mode,
       aiEnabled: Boolean(d.aiEnabled),
-      network: d.network || 'mainnet',
+      network: d.network || defaults.network,
       masterWalletAddress: d.masterWalletAddress || '',
       mevShieldEnabled: d.mevShieldEnabled !== false,
-      maxSlippageBps: Number(d.maxSlippageBps || 25),
-      maxOracleDeviationBps: Number(d.maxOracleDeviationBps || 45),
-      riskPerTradeUsd: Number(d.riskPerTradeUsd || 50),
+      maxSlippageBps: Number(d.maxSlippageBps ?? defaults.maxSlippageBps),
+      maxOracleDeviationBps: Number(d.maxOracleDeviationBps ?? defaults.maxOracleDeviationBps),
+      riskPerTradeUsd: Number(d.riskPerTradeUsd ?? defaults.riskPerTradeUsd),
       soundEnabled: d.soundEnabled !== false,
       aiProvider: d.aiProvider === 'custom_ai' ? 'custom_ai' : 'gemini',
       customAiUrl: d.customAiUrl || '',
       customAiModel: d.customAiModel || '',
       customSystemPrompt: d.customSystemPrompt || '',
-      scanIntervalSec: Number(d.scanIntervalSec || 180),
-      minConfidence: Number(d.minConfidence || 68),
-      minQuantScore: Number(d.minQuantScore || 58),
-      minVolumeM: Number(d.minVolumeM || 2),
-      tpPct: Number(d.tpPct || 3.0),
-      slPct: Number(d.slPct || 1.4),
+      scanIntervalSec: Number(d.scanIntervalSec ?? defaults.scanIntervalSec),
+      minConfidence: Number(d.minConfidence ?? defaults.minConfidence),
+      minQuantScore: Number(d.minQuantScore ?? defaults.minQuantScore),
+      minVolumeM: Number(d.minVolumeM ?? defaults.minVolumeM),
+      tpPct: Number(d.tpPct ?? defaults.tpPct),
+      slPct: Number(d.slPct ?? defaults.slPct),
       useDeepThinking: Boolean(d.useDeepThinking),
       useSearchGrounding: Boolean(d.useSearchGrounding),
       sizingMode: d.sizingMode === 'fixed_usd' ? 'fixed_usd' : 'equity_pct',
-      capitalPctPerTrade: Number(d.capitalPctPerTrade || 25),
-      maxOpenPositions: Number(d.maxOpenPositions || 3),
+      capitalPctPerTrade: Number(d.capitalPctPerTrade ?? defaults.capitalPctPerTrade),
+      maxOpenPositions: Number(d.maxOpenPositions ?? defaults.maxOpenPositions),
       trailingStopEnabled: d.trailingStopEnabled !== false,
       autoManagePositions: d.autoManagePositions !== false,
+      riskPerTradePct: Number(d.riskPerTradePct ?? defaults.riskPerTradePct),
+      dailyMaxLossPct: Number(d.dailyMaxLossPct ?? defaults.dailyMaxLossPct),
+      killSwitchEnabled: Boolean(d.killSwitchEnabled),
+      geminiModel: typeof d.geminiModel === 'string' && d.geminiModel.trim() ? d.geminiModel.trim() : 'auto',
+      globalBiasLock: sanitizeBiasLock(d.globalBiasLock),
+      pairBiasLocksJson: typeof d.pairBiasLocksJson === 'string' ? d.pairBiasLocksJson : '{}',
+      useAloEntries: Boolean(d.useAloEntries),
+      minOrderUsdFloor: Number(d.minOrderUsdFloor ?? defaults.minOrderUsdFloor),
+      streakCooldownHours: Number(d.streakCooldownHours ?? defaults.streakCooldownHours),
+      watchlistCoinsCsv:
+        typeof d.watchlistCoinsCsv === 'string' && d.watchlistCoinsCsv.trim()
+          ? d.watchlistCoinsCsv.trim()
+          : defaults.watchlistCoinsCsv,
+      mcloudEnabled: d.mcloudEnabled !== false,
+      mcloudUrl:
+        typeof d.mcloudUrl === 'string' && d.mcloudUrl.trim()
+          ? d.mcloudUrl.trim()
+          : defaults.mcloudUrl,
     };
   } catch (err) {
     handleFirestoreError(err, OperationType.GET, configPath);
@@ -130,9 +206,55 @@ export async function saveBotConfig(uid: string, patch: Partial<BotConfigData>) 
   const path = `users/${uid}/bot_configs/default`;
   const ref = doc(db, 'users', uid, 'bot_configs', 'default');
 
-  // Remove immutable/non-patchable ownerId if passed in full config object
   const { ownerId: _ignoredOwner, ...rest } = patch;
-  const sanitized: Record<string, unknown> = { ...rest };
+  const sanitized: Record<string, unknown> = {};
+
+  const allowedKeys: Array<keyof Omit<BotConfigData, 'ownerId'>> = [
+    'mode',
+    'aiEnabled',
+    'network',
+    'masterWalletAddress',
+    'mevShieldEnabled',
+    'maxSlippageBps',
+    'maxOracleDeviationBps',
+    'riskPerTradeUsd',
+    'soundEnabled',
+    'aiProvider',
+    'customAiUrl',
+    'customAiModel',
+    'customSystemPrompt',
+    'scanIntervalSec',
+    'minConfidence',
+    'minQuantScore',
+    'minVolumeM',
+    'tpPct',
+    'slPct',
+    'useDeepThinking',
+    'useSearchGrounding',
+    'sizingMode',
+    'capitalPctPerTrade',
+    'maxOpenPositions',
+    'trailingStopEnabled',
+    'autoManagePositions',
+    'riskPerTradePct',
+    'dailyMaxLossPct',
+    'killSwitchEnabled',
+    'geminiModel',
+    'globalBiasLock',
+    'pairBiasLocksJson',
+    'useAloEntries',
+    'minOrderUsdFloor',
+    'streakCooldownHours',
+    'watchlistCoinsCsv',
+    'mcloudEnabled',
+    'mcloudUrl',
+  ];
+
+  for (const k of allowedKeys) {
+    if (k in rest && rest[k] !== undefined) {
+      sanitized[k] = rest[k];
+    }
+  }
 
   if (typeof sanitized.maxSlippageBps === 'number') {
     sanitized.maxSlippageBps = Math.max(1, Math.min(500, sanitized.maxSlippageBps));
@@ -144,10 +266,10 @@ export async function saveBotConfig(uid: string, patch: Partial<BotConfigData>) 
     sanitized.riskPerTradeUsd = Math.max(1, Math.min(1000000, sanitized.riskPerTradeUsd));
   }
   if (typeof sanitized.scanIntervalSec === 'number') {
-    sanitized.scanIntervalSec = Math.max(30, Math.min(3600, sanitized.scanIntervalSec));
+    sanitized.scanIntervalSec = Math.max(15, Math.min(3600, sanitized.scanIntervalSec));
   }
   if (typeof sanitized.minConfidence === 'number') {
-    sanitized.minConfidence = Math.max(40, Math.min(99, sanitized.minConfidence));
+    sanitized.minConfidence = Math.max(35, Math.min(99, sanitized.minConfidence));
   }
   if (typeof sanitized.minQuantScore === 'number') {
     sanitized.minQuantScore = Math.max(20, Math.min(95, sanitized.minQuantScore));
@@ -156,10 +278,10 @@ export async function saveBotConfig(uid: string, patch: Partial<BotConfigData>) 
     sanitized.minVolumeM = Math.max(0.1, Math.min(500, sanitized.minVolumeM));
   }
   if (typeof sanitized.tpPct === 'number') {
-    sanitized.tpPct = Math.max(0.2, Math.min(100, sanitized.tpPct));
+    sanitized.tpPct = Math.max(0.2, Math.min(200, sanitized.tpPct));
   }
   if (typeof sanitized.slPct === 'number') {
-    sanitized.slPct = Math.max(0.2, Math.min(50, sanitized.slPct));
+    sanitized.slPct = Math.max(0.05, Math.min(50, sanitized.slPct));
   }
   if (typeof sanitized.masterWalletAddress === 'string') {
     sanitized.masterWalletAddress = sanitized.masterWalletAddress.slice(0, 64);
@@ -179,6 +301,35 @@ export async function saveBotConfig(uid: string, patch: Partial<BotConfigData>) 
   if (typeof sanitized.maxOpenPositions === 'number') {
     sanitized.maxOpenPositions = Math.max(1, Math.min(20, Math.round(sanitized.maxOpenPositions)));
   }
+  if (typeof sanitized.riskPerTradePct === 'number') {
+    sanitized.riskPerTradePct = Math.max(0.05, Math.min(25, sanitized.riskPerTradePct));
+  }
+  if (typeof sanitized.dailyMaxLossPct === 'number') {
+    sanitized.dailyMaxLossPct = Math.max(0.1, Math.min(100, sanitized.dailyMaxLossPct));
+  }
+  if (typeof sanitized.geminiModel === 'string') {
+    sanitized.geminiModel = (sanitized.geminiModel || 'auto').slice(0, 120);
+  }
+  if ('globalBiasLock' in sanitized) {
+    sanitized.globalBiasLock = sanitizeBiasLock(sanitized.globalBiasLock);
+  }
+  if (typeof sanitized.pairBiasLocksJson === 'string') {
+    sanitized.pairBiasLocksJson = sanitized.pairBiasLocksJson.slice(0, 1000);
+  }
+  if (typeof sanitized.minOrderUsdFloor === 'number') {
+    sanitized.minOrderUsdFloor = Math.max(0, Math.min(1000, sanitized.minOrderUsdFloor));
+  }
+  if (typeof sanitized.streakCooldownHours === 'number') {
+    sanitized.streakCooldownHours = Math.max(0.5, Math.min(72, sanitized.streakCooldownHours));
+  }
+  if (typeof sanitized.watchlistCoinsCsv === 'string') {
+    sanitized.watchlistCoinsCsv = sanitized.watchlistCoinsCsv.slice(0, 500);
+  }
+  if (typeof sanitized.mcloudUrl === 'string') {
+    sanitized.mcloudUrl = sanitized.mcloudUrl.slice(0, 256);
+  }
+
+  if (Object.keys(sanitized).length === 0) return;
 
   try {
     await updateDoc(ref, {
@@ -199,7 +350,7 @@ export function subscribePositions(
     collection(db, 'users', uid, 'positions'),
     where('ownerId', '==', uid),
     orderBy('updatedAt', 'desc'),
-    limit(100)
+    limit(500)
   );
   return onSnapshot(
     q,
@@ -222,6 +373,8 @@ export function subscribePositions(
           hlOrderId: data.hlOrderId || '',
           thesis: data.thesis || '',
           strategyTag: data.strategyTag || '',
+          cloid: data.cloid || '',
+          isExternal: Boolean(data.isExternal),
           createdAtMs: data.createdAt?.toMillis?.() ?? Date.now(),
           updatedAtMs: data.updatedAt?.toMillis?.() ?? Date.now(),
         };
@@ -253,12 +406,34 @@ export async function createPersistedPosition(
       hlOrderId: pos.hlOrderId.slice(0, 128),
       thesis: pos.thesis.slice(0, 600),
       strategyTag: (pos.strategyTag || '').slice(0, 160),
+      ...(pos.cloid ? { cloid: pos.cloid.slice(0, 72) } : {}),
+      ...(typeof pos.isExternal === 'boolean' ? { isExternal: pos.isExternal } : {}),
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
     return ref.id;
   } catch (err) {
     handleFirestoreError(err, OperationType.CREATE, path);
+  }
+}
+
+export async function updateOpenPersistedPositionSize(
+  uid: string,
+  positionId: string,
+  remainingSize: number,
+  markPx: number,
+  unrealizedPnl: number
+) {
+  const path = `users/${uid}/positions/${positionId}`;
+  try {
+    await updateDoc(doc(db, 'users', uid, 'positions', positionId), {
+      size: Math.max(0, remainingSize),
+      markPx,
+      unrealizedPnl,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
 
@@ -291,7 +466,7 @@ export function subscribeTradeLogs(
     collection(db, 'users', uid, 'trade_logs'),
     where('ownerId', '==', uid),
     orderBy('createdAt', 'desc'),
-    limit(120)
+    limit(300)
   );
   return onSnapshot(
     q,
@@ -344,7 +519,7 @@ export function subscribeAiMemories(
     collection(db, 'users', uid, 'ai_memory'),
     where('ownerId', '==', uid),
     orderBy('createdAt', 'desc'),
-    limit(60)
+    limit(500)
   );
   return onSnapshot(
     q,
@@ -397,7 +572,7 @@ export function subscribeChatMessages(
     collection(db, 'users', uid, 'chat_messages'),
     where('ownerId', '==', uid),
     orderBy('createdAt', 'asc'),
-    limit(60)
+    limit(150)
   );
   return onSnapshot(
     q,
@@ -452,7 +627,7 @@ export async function syncStrategyPlaybook(uid: string) {
           preferredRegimes: item.preferredRegimes.slice(0, 180),
           entryRule: item.entryRule.slice(0, 400),
           positionManagementGuide: item.positionManagementGuide.slice(0, 400),
-          weight: item.weight,
+          weight: 1.0,
           wins: 0,
           losses: 0,
           totalPnlUsd: 0,
@@ -460,6 +635,22 @@ export async function syncStrategyPlaybook(uid: string) {
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
+      } else {
+        const d = snap.data();
+        const totalTrades = Number(d.wins ?? 0) + Number(d.losses ?? 0);
+        const totalPnlUsd = Number(d.totalPnlUsd ?? 0);
+        const curWeight = Number(d.weight ?? 1.0);
+        if (totalTrades < MIN_ATTRIBUTABLE_TRADES && curWeight !== 1.0) {
+          await updateDoc(ref, {
+            weight: 1.0,
+            updatedAt: serverTimestamp(),
+          });
+        } else if (totalPnlUsd < 0 && curWeight > 1.0) {
+          await updateDoc(ref, {
+            weight: 1.0,
+            updatedAt: serverTimestamp(),
+          });
+        }
       }
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, path);
@@ -480,10 +671,13 @@ export function subscribeStrategyPlaybook(
   return onSnapshot(
     q,
     (snap) => {
-      const items: StrategyPlaybookItem[] = snap.docs.map((d) => {
+      const byStrategyId = new Map<string, StrategyPlaybookItem>();
+      for (const d of snap.docs) {
         const data = d.data();
-        return {
-          strategyId: data.strategyId || d.id,
+        const sid = String(data.strategyId || d.id || '').trim();
+        if (!sid) continue;
+        const item: StrategyPlaybookItem = {
+          strategyId: sid,
           ownerId: data.ownerId,
           name: data.name,
           category: data.category,
@@ -497,19 +691,36 @@ export function subscribeStrategyPlaybook(
           enabled: data.enabled !== false,
           updatedAtMs: data.updatedAt?.toMillis?.() ?? Date.now(),
         };
-      });
-      onData(items);
+        const prev = byStrategyId.get(sid);
+        if (!prev || d.id === sid || item.wins + item.losses >= prev.wins + prev.losses) {
+          byStrategyId.set(sid, item);
+        }
+      }
+      onData(Array.from(byStrategyId.values()));
     },
     (error) => handleFirestoreError(error, OperationType.LIST, path)
   );
 }
 
+// Attribution strictly deduplicated by tradeId and proportional (pnlUsd / uniqueIds.length) — never duplicates 100% of losses across all strategies!
 export async function recordStrategyTradeOutcome(
   uid: string,
   strategyIds: string[],
-  pnlUsd: number
+  pnlUsd: number,
+  tradeId?: string
 ) {
   const uniqueIds = Array.from(new Set(strategyIds.filter(Boolean)));
+  if (uniqueIds.length === 0) return;
+
+  const dedupKey = tradeId ? `${uid}:${tradeId}` : '';
+  if (dedupKey && loadAttributedTradeIds().has(dedupKey)) {
+    return;
+  }
+  if (dedupKey) {
+    markTradeIdAttributed(dedupKey);
+  }
+
+  const pnlShare = pnlUsd / uniqueIds.length;
   const isWin = pnlUsd > 0.05;
   const isLoss = pnlUsd < -0.05;
 
@@ -520,13 +731,18 @@ export async function recordStrategyTradeOutcome(
       const snap = await getDoc(ref);
       if (!snap.exists()) continue;
       const d = snap.data();
-      const prevWeight = Number(d.weight ?? 1.0);
-      const delta = isWin ? 0.08 : isLoss ? -0.09 : 0;
-      const nextWeight = Number(Math.max(0.3, Math.min(2.5, prevWeight + delta)).toFixed(2));
+      const nextWins = Number(d.wins ?? 0) + (isWin ? 1 : 0);
+      const nextLosses = Number(d.losses ?? 0) + (isLoss ? 1 : 0);
+      const nextTotalPnl = Number((Number(d.totalPnlUsd ?? 0) + pnlShare).toFixed(4));
+      const nextWeight = computeCalibratedStrategyWeight({
+        wins: nextWins,
+        losses: nextLosses,
+        totalPnlUsd: nextTotalPnl,
+      });
       await updateDoc(ref, {
-        wins: Number(d.wins ?? 0) + (isWin ? 1 : 0),
-        losses: Number(d.losses ?? 0) + (isLoss ? 1 : 0),
-        totalPnlUsd: Number((Number(d.totalPnlUsd ?? 0) + pnlUsd).toFixed(4)),
+        wins: nextWins,
+        losses: nextLosses,
+        totalPnlUsd: nextTotalPnl,
         weight: nextWeight,
         updatedAt: serverTimestamp(),
       });
@@ -541,14 +757,125 @@ export async function toggleStrategyPlaybookItem(
   strategyId: string,
   enabled: boolean
 ) {
+  return updateStrategyPlaybookItem(uid, strategyId, { enabled });
+}
+
+export async function updateStrategyPlaybookItem(
+  uid: string,
+  strategyId: string,
+  patch: { enabled?: boolean; weight?: number }
+) {
   const path = `users/${uid}/strategy_playbook/${strategyId}`;
+  const updateFields: Record<string, unknown> = {
+    updatedAt: serverTimestamp(),
+  };
+  if (typeof patch.enabled === 'boolean') {
+    updateFields.enabled = patch.enabled;
+  }
+  if (typeof patch.weight === 'number' && Number.isFinite(patch.weight)) {
+    updateFields.weight = Number(Math.max(0.3, Math.min(2.5, patch.weight)).toFixed(2));
+  }
   try {
-    await updateDoc(doc(db, 'users', uid, 'strategy_playbook', strategyId), {
-      enabled,
-      updatedAt: serverTimestamp(),
-    });
+    await updateDoc(doc(db, 'users', uid, 'strategy_playbook', strategyId), updateFields);
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
 
+export async function backfillLocalArchiveToFirestore(
+  uid: string,
+  localPositions: PersistedPosition[],
+  localMemories: AiMemoryEntry[]
+): Promise<{ addedPositions: number; addedMemories: number }> {
+  let addedPositions = 0;
+  let addedMemories = 0;
+
+  const unsyncedPositions = localPositions.filter((p) => p.id.startsWith('local-'));
+  if (unsyncedPositions.length > 0) {
+    const posPath = `users/${uid}/positions`;
+    try {
+      const snap = await getDocs(
+        query(collection(db, 'users', uid, 'positions'), where('ownerId', '==', uid), limit(500))
+      );
+      const existingFps = new Set(
+        snap.docs.map((d) => {
+          const data = d.data();
+          return positionFingerprint({
+            coin: String(data.coin || ''),
+            side: (data.side === 'SHORT' ? 'SHORT' : 'LONG') as 'LONG' | 'SHORT',
+            hlOrderId: String(data.hlOrderId || ''),
+            entryPx: Number(data.entryPx || 0),
+            status: (data.status === 'CLOSED' ? 'CLOSED' : 'OPEN') as 'OPEN' | 'CLOSED',
+          });
+        })
+      );
+
+      for (const p of unsyncedPositions) {
+        const fp = positionFingerprint(p);
+        if (existingFps.has(fp)) continue;
+        await createPersistedPosition(uid, {
+          coin: p.coin,
+          side: p.side,
+          size: p.size,
+          entryPx: p.entryPx,
+          markPx: p.markPx,
+          leverage: p.leverage,
+          unrealizedPnl: p.unrealizedPnl,
+          realizedPnl: p.realizedPnl,
+          status: p.status,
+          mode: p.mode,
+          hlOrderId: p.hlOrderId,
+          thesis: p.thesis,
+          strategyTag: p.strategyTag || '',
+          ...(p.cloid ? { cloid: p.cloid } : {}),
+          ...(typeof p.isExternal === 'boolean' ? { isExternal: p.isExternal } : {}),
+        });
+        existingFps.add(fp);
+        addedPositions += 1;
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, posPath);
+    }
+  }
+
+  const unsyncedMemories = localMemories.filter(
+    (m) => m.id.startsWith('local-') || m.id.startsWith('hist-')
+  );
+  if (unsyncedMemories.length > 0) {
+    const memPath = `users/${uid}/ai_memory`;
+    try {
+      const snap = await getDocs(
+        query(collection(db, 'users', uid, 'ai_memory'), where('ownerId', '==', uid), limit(500))
+      );
+      const existingFps = new Set(
+        snap.docs.map((d) => {
+          const data = d.data();
+          return memoryFingerprint({
+            coin: String(data.coin || ''),
+            regime: String(data.regime || ''),
+            outcome: (data.outcome || 'BREAKEVEN') as 'WIN' | 'LOSS' | 'BREAKEVEN',
+            lesson: String(data.lesson || ''),
+          });
+        })
+      );
+
+      for (const m of unsyncedMemories) {
+        const fp = memoryFingerprint(m);
+        if (existingFps.has(fp)) continue;
+        await appendAiMemory(uid, {
+          coin: m.coin,
+          regime: m.regime,
+          outcome: m.outcome,
+          pnlUsd: m.pnlUsd,
+          lesson: m.lesson,
+        });
+        existingFps.add(fp);
+        addedMemories += 1;
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.LIST, memPath);
+    }
+  }
+
+  return { addedPositions, addedMemories };
+}

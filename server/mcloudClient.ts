@@ -249,7 +249,7 @@ export async function emitMcloudEvent(
 ): Promise<{ ok: boolean; status: number; latencyMs: number; error?: string }> {
   const base = normalizeMcloudBaseUrl(baseUrlOverride);
   const explicitSlug = extractMcloudWebhookSlug(baseUrlOverride);
-  const slugs = Array.from(new Set([...(explicitSlug ? [explicitSlug] : []), 'tug777', 'tug777-events']));
+  const slugs = Array.from(new Set([...(explicitSlug ? [explicitSlug] : []), 'tug777', 'tugg777', 'tug777-events']));
   const bodyString = JSON.stringify({
     evento: eventType,
     origen: 'tug777-engine',
@@ -320,12 +320,12 @@ export async function probeMcloudHealth(baseUrlOverride?: string): Promise<{
         headers: buildMcloudSignedHeaders(probeBody, { useWebhookBearer: true }),
         body: probeBody,
       },
-      3500
+      6500
     ).catch((e) => ({ status: 0, ok: false, latencyMs: 0, rawText: String(e), json: null })),
     fetchWithTimeout(
       `${base}/api/kv/tug777/context`,
       { method: 'GET', headers: buildMcloudSignedHeaders('', { useApiKeyBearer: true }) },
-      3500
+      6500
     ).catch((e) => ({ status: 0, ok: false, latencyMs: 0, rawText: String(e), json: null })),
     fetchWithTimeout(
       `${base}/api/wh/tug777`,
@@ -334,7 +334,7 @@ export async function probeMcloudHealth(baseUrlOverride?: string): Promise<{
         headers: buildMcloudSignedHeaders(probeBody, { useWebhookBearer: true }),
         body: probeBody,
       },
-      3500
+      6500
     ).catch((e) => ({ status: 0, ok: false, latencyMs: 0, rawText: String(e), json: null })),
   ]);
 

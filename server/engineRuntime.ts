@@ -49,6 +49,7 @@ import {
   inferWithMcloud,
   normalizeMcloudBaseUrl,
   probeMcloudHealth,
+  saveMcloudKvObject,
 } from './mcloudClient.ts';
 
 const CONFIG_PATH = path.resolve(process.cwd(), 'data', 'engine-config.json');
@@ -86,6 +87,7 @@ function defaultEngineConfig(): BotConfigData {
     sizingMode: 'equity_pct',
     capitalPctPerTrade: 15,
     maxOpenPositions: 2,
+    leverage: 10,
     trailingStopEnabled: true,
     autoManagePositions: true,
     riskPerTradePct: 0.35,
@@ -149,6 +151,8 @@ export class Tug777EngineRuntime {
   private selectedInterval: '1m' | '5m' | '15m' | '1h' | '4h' = '15m';
   private markets: HlAssetMarket[] = [];
   private l2Books = new Map<string, { bids: HlL2Level[]; asks: HlL2Level[] }>();
+  private l2LastError: string | null = null;
+  private l2UpdatedAtMs = 0;
   private candlesByKey = new Map<string, HlCandle[]>();
   private accountSummary: HlAccountSummary | null = null;
   private fills: HlUserFill[] = [];
@@ -256,6 +260,16 @@ export class Tug777EngineRuntime {
           this.wsConnected = status.connected;
           this.wsUrl = status.wsUrl;
           this.wsLatencyMs = status.wsLatencyMs;
+          if (!status.connected && status.reason) {
+            this.l2LastError = `WS L2 desconectado: ${status.reason}`;
+          }
+        },
+        onError: (channel, detail) => {
+          const msg = `[${channel}] ${detail}`;
+          if (this.l2LastError !== msg) {
+            this.l2LastError = msg;
+            this.addLog('WARN', 'L2_ENGINE', this.selectedCoin, msg);
+          }
         },
       }
     );
@@ -484,32 +498,64 @@ export class Tug777EngineRuntime {
         }))
         .sort((a, b) => a.t - b.t);
       this.candlesByKey.set(`${coin}:${interval}`, parsed);
-    } catch {
-      // ignore transient
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.addLog('WARN', 'HL_CANDLES', coin, `Error cargando velas (${interval}): ${msg}`);
     }
   }
 
   private async hydrateL2Book(coin: string) {
     try {
-      const { data } = await this.postHlInfo<{
-        levels: [
+      const { data, latencyMs } = await this.postHlInfo<{
+        levels?: [
           Array<{ px: string; sz: string; n: number }>,
           Array<{ px: string; sz: string; n: number }>
         ];
-      }>({ type: 'l2Book', coin });
-      const bids = (data?.levels?.[0] || []).slice(0, 12).map((l) => ({
-        px: Number(l.px),
-        sz: Number(l.sz),
-        n: l.n,
-      }));
-      const asks = (data?.levels?.[1] || []).slice(0, 12).map((l) => ({
-        px: Number(l.px),
-        sz: Number(l.sz),
-        n: l.n,
-      }));
+      } | null>({ type: 'l2Book', coin });
+      if (!data || !Array.isArray(data.levels)) {
+        const msg = `Respuesta L2 nula/inválida de Hyperliquid para ${coin}`;
+        if (coin === this.selectedCoin && this.l2LastError !== msg) {
+          this.l2LastError = msg;
+          this.addLog('WARN', 'L2_ENGINE', coin, msg, latencyMs);
+        }
+        return;
+      }
+      const bids = (data.levels[0] || [])
+        .slice(0, 12)
+        .map((l) => ({
+          px: Number(l.px),
+          sz: Number(l.sz),
+          n: l.n,
+        }))
+        .filter((l) => Number.isFinite(l.px) && l.px > 0 && Number.isFinite(l.sz) && l.sz > 0);
+      const asks = (data.levels[1] || [])
+        .slice(0, 12)
+        .map((l) => ({
+          px: Number(l.px),
+          sz: Number(l.sz),
+          n: l.n,
+        }))
+        .filter((l) => Number.isFinite(l.px) && l.px > 0 && Number.isFinite(l.sz) && l.sz > 0);
+      if (bids.length === 0 && asks.length === 0) {
+        const msg = `Libro L2 vacío (0 bids / 0 asks) en Hyperliquid para ${coin}`;
+        if (coin === this.selectedCoin && this.l2LastError !== msg) {
+          this.l2LastError = msg;
+          this.addLog('WARN', 'L2_ENGINE', coin, msg, latencyMs);
+        }
+        return;
+      }
       this.l2Books.set(coin, { bids, asks });
-    } catch {
-      // ignore transient
+      if (coin === this.selectedCoin) {
+        this.l2LastError = null;
+        this.l2UpdatedAtMs = Date.now();
+      }
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      const msg = `Error REST L2 (${coin}): ${raw}`;
+      if (coin === this.selectedCoin && this.l2LastError !== msg) {
+        this.l2LastError = msg;
+        this.addLog('WARN', 'L2_ENGINE', coin, msg);
+      }
     }
   }
 
@@ -665,6 +711,8 @@ export class Tug777EngineRuntime {
     this.lastWsEventAtMs = ts;
     this.l2Books.set(coin, { bids, asks });
     if (coin === this.selectedCoin) {
+      this.l2LastError = null;
+      this.l2UpdatedAtMs = ts;
       this.broadcast({ type: 'l2_tick', payload: { coin, bids, asks }, ts });
     }
   }
@@ -699,6 +747,44 @@ export class Tug777EngineRuntime {
     return res;
   }
 
+  public updateMcloudProbeStatus(res: { ok: boolean; detail: string }) {
+    this.mcloudConnected = res.ok;
+    this.mcloudLastStatus = `${res.ok ? 'OK' : 'OFFLINE'} · ${res.detail}`;
+  }
+
+  public async syncSnapshotToMcloud(overrideUrl?: string) {
+    const targetUrl = overrideUrl || this.config.mcloudUrl;
+    const summary: Record<string, unknown> = {
+      service: 'tug777-engine',
+      network: this.config.network,
+      enginePaused: this.enginePaused,
+      aiEnabled: this.config.aiEnabled,
+      wsConnected: this.wsConnected,
+      wsLatencyMs: this.wsLatencyMs,
+      selectedCoin: this.selectedCoin,
+      leverage: this.config.leverage ?? 10,
+      scannedTokenCount: this.markets.length,
+      openPositionsCount: this.accountSummary?.positions?.length ?? 0,
+      accountValueUsd: this.accountSummary?.accountValue ?? 0,
+      updatedAtMs: Date.now(),
+    };
+    const [webhookResult, kvResult] = await Promise.all([
+      emitMcloudEvent('tug777_engine_sync', summary, targetUrl),
+      saveMcloudKvObject('tug777', 'engine_state', summary, targetUrl),
+    ]);
+    const ok = webhookResult.ok || kvResult.ok;
+    this.mcloudConnected = ok;
+    this.mcloudLastStatus = `${ok ? 'SYNC_OK' : 'SYNC_ERR'} · wh=${webhookResult.status || 'ERR'}(${webhookResult.latencyMs}ms) · kv=${kvResult.status || 'ERR'}(${kvResult.latencyMs}ms)`;
+    this.addLog(
+      ok ? 'INFO' : 'WARN',
+      'MCLOUD_SYNC',
+      this.selectedCoin,
+      `Sincronización manual a mcloud (${normalizeMcloudBaseUrl(targetUrl)}): ${this.mcloudLastStatus}`,
+      Math.max(webhookResult.latencyMs, kvResult.latencyMs)
+    );
+    return { ok, baseUrl: normalizeMcloudBaseUrl(targetUrl), webhookResult, kvResult };
+  }
+
   public getSnapshot(): EngineStateSnapshot {
     const watchlist = parseWatchlist(this.config.watchlistCoinsCsv);
     const counts = getRegistryCounts();
@@ -724,6 +810,8 @@ export class Tug777EngineRuntime {
       selectedInterval: this.selectedInterval,
       markets: this.markets.slice(0, 80),
       selectedL2Book: this.l2Books.get(this.selectedCoin) || { bids: [], asks: [] },
+      l2LastError: this.l2LastError,
+      l2UpdatedAtMs: this.l2UpdatedAtMs,
       selectedCandles: this.candlesByKey.get(`${this.selectedCoin}:${this.selectedInterval}`) || [],
       accountSummary: this.accountSummary,
       fills: this.fills,
@@ -952,6 +1040,8 @@ export class Tug777EngineRuntime {
       slPct: this.config.slPct || 0.85,
       tpPct: this.config.tpPct || 3.5,
       useAloEntries: typeof params.useAlo === 'boolean' ? params.useAlo : Boolean(this.config.useAloEntries),
+      targetLeverage: this.config.leverage ?? 10,
+      maxLeverage: asset.maxLeverage,
       strategyTag: 'MANUAL_ENGINE',
     });
 
@@ -1092,6 +1182,14 @@ export class Tug777EngineRuntime {
         const c15 = this.candlesByKey.get(`${coin}:15m`) || [];
         const c1h = this.candlesByKey.get(`${coin}:1h`) || c15;
         const book = this.l2Books.get(coin) || { bids: [], asks: [] };
+        if (book.bids.length === 0 || book.asks.length === 0) {
+          this.addLog(
+            'WARN',
+            'L2_ENGINE',
+            coin,
+            this.l2LastError || `Libro L2 incompleto para ${coin} (bids=${book.bids.length}, asks=${book.asks.length}) durante análisis`
+          );
+        }
         if (c15.length < 20) continue;
         analyses.push(
           evaluateUnifiedDeepSetup({
@@ -1345,6 +1443,8 @@ export class Tug777EngineRuntime {
         tp1Pct: opt.tp1Pct,
         tp2Pct: opt.tp2Pct,
         useAloEntries: Boolean(this.config.useAloEntries),
+        targetLeverage: this.config.leverage ?? 10,
+        maxLeverage: targetAsset.maxLeverage,
         strategyTag: (brainDecision.strategiesUsed || targetDeep.firedStrategies).join('+'),
         strategies: brainDecision.strategiesUsed || targetDeep.firedStrategies,
       });

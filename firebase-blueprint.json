@@ -122,6 +122,9 @@
         "maxOpenPositions": {
           "type": "number"
         },
+        "leverage": {
+          "type": "number"
+        },
         "trailingStopEnabled": {
           "type": "boolean"
         },

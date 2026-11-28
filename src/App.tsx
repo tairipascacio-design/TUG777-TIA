@@ -25,9 +25,9 @@ import {
 import { AiBrainParamsModal } from './components/AiBrainParamsModal';
 import { AiCopilotDrawer } from './components/AiCopilotDrawer';
 import { ApiWalletModal } from './components/ApiWalletModal';
-import { DropletDeployView } from './components/DropletDeployView';
 import { LiveCandleChart } from './components/LiveCandleChart';
 import { LogsAndMemoryView } from './components/LogsAndMemoryView';
+import { McloudInfraView } from './components/McloudInfraView';
 import { OrderBookPanel } from './components/OrderBookPanel';
 import { PnlView } from './components/PnlView';
 import { PositionsView } from './components/PositionsView';
@@ -83,6 +83,7 @@ import {
 import {
   auditMevShieldFilters,
   buildBackendApiUrl,
+  connectDirectHyperliquidWs,
   connectEngineWebSocket,
   controlEngine,
   evaluateMevShield,
@@ -142,7 +143,7 @@ import { formatSignedUsd } from './utils/formatters';
 import { soundEngine } from './utils/soundEngine';
 import { voiceEngine, type ParsedVoiceCommand } from './utils/voiceEngine';
 
-type ActiveTab = 'terminal' | 'positions' | 'pnl' | 'logs' | 'droplet';
+type ActiveTab = 'terminal' | 'positions' | 'pnl' | 'logs' | 'mcloud';
 
 const INITIAL_CONFIG: BotConfigData = {
   ownerId: '',
@@ -182,21 +183,25 @@ const INITIAL_CONFIG: BotConfigData = {
   minOrderUsdFloor: 12,
   streakCooldownHours: 3,
   watchlistCoinsCsv: 'BTC,ETH,SOL,HYPE',
+  leverage: 10,
   mcloudEnabled: true,
   mcloudUrl: 'https://mcloud-1036926196544.us-east1.run.app',
 };
 
-const WINNING_CALIBRATION_KEY = 'tug777_quant_v34';
+const WINNING_CALIBRATION_KEY = 'tug777_quant_v35';
 
 function applyWinningCalibrationIfNeeded(cfg: BotConfigData): { cfg: BotConfigData; upgraded: boolean } {
   if (typeof window === 'undefined') return { cfg, upgraded: false };
   try {
-    // Never overwrite user-saved settings once initialized!
+    // Migrate smoothly to v3.5 (10x leverage default) once without overwriting user's other settings
     if (localStorage.getItem(WINNING_CALIBRATION_KEY) === '1') {
       return { cfg, upgraded: false };
     }
     localStorage.setItem(WINNING_CALIBRATION_KEY, '1');
-    return { cfg, upgraded: false };
+    return {
+      cfg: { ...cfg, leverage: 10 },
+      upgraded: true,
+    };
   } catch {
     return { cfg, upgraded: false };
   }
@@ -250,6 +255,23 @@ export default function App() {
   const [candles, setCandles] = useState<HlCandle[]>([]);
   const [candlesLoading, setCandlesLoading] = useState(false);
   const [l2Book, setL2Book] = useState<{ bids: HlL2Level[]; asks: HlL2Level[] }>({ bids: [], asks: [] });
+  const [l2Error, setL2Error] = useState<string | null>(null);
+  const [l2Loading, setL2Loading] = useState<boolean>(false);
+  const [l2Source, setL2Source] = useState<string>('HL-WS-LIVE');
+  const [l2UpdatedAtMs, setL2UpdatedAtMs] = useState<number>(0);
+  const l2BookRef = useRef<{ bids: HlL2Level[]; asks: HlL2Level[] }>({ bids: [], asks: [] });
+  l2BookRef.current = l2Book;
+  const l2UpdatedAtMsRef = useRef<number>(0);
+  const lastLoggedL2ErrorRef = useRef<string | null>(null);
+  const logEventRef = useRef<
+    (
+      level: TradeLogEntry['level'],
+      category: string,
+      coin: string,
+      message: string,
+      latencyMs?: number
+    ) => Promise<void>
+  >(async () => {});
   const [hlLatencyMs, setHlLatencyMs] = useState<number>(0);
   const [hlChannel, setHlChannel] = useState<string>('TUG777-ENGINE');
   const [engineWsConnected, setEngineWsConnected] = useState(false);
@@ -566,6 +588,7 @@ export default function App() {
           }
           if (calibratedLoaded.upgraded) {
             void saveBotConfig(firebaseUser.uid, {
+              leverage: finalLoadedCfg.leverage ?? 10,
               slPct: finalLoadedCfg.slPct,
               tpPct: finalLoadedCfg.tpPct,
               minConfidence: finalLoadedCfg.minConfidence,
@@ -658,8 +681,17 @@ export default function App() {
     setHlChannel(snap.wsConnected ? 'HL-WS-LIVE' : 'TUG777-ENGINE');
 
     if (snap.selectedCoin === selectedCoinRef.current) {
-      if (snap.selectedL2Book?.bids?.length || snap.selectedL2Book?.asks?.length) {
+      if (snap.selectedL2Book?.bids?.length && snap.selectedL2Book?.asks?.length) {
         setL2Book(snap.selectedL2Book);
+        setL2Error(null);
+        setL2Loading(false);
+        setL2Source(snap.wsConnected ? 'HL-WS-LIVE' : 'ENGINE-REST');
+        const l2Ts = snap.l2UpdatedAtMs || snap.updatedAtMs || Date.now();
+        setL2UpdatedAtMs(l2Ts);
+        l2UpdatedAtMsRef.current = l2Ts;
+      } else if (snap.l2LastError) {
+        setL2Error(snap.l2LastError);
+        setL2Loading(false);
       }
       if (snap.selectedInterval === intervalRef.current && snap.selectedCandles?.length) {
         setCandles(snap.selectedCandles);
@@ -684,91 +716,177 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!hasConfiguredBackendForApk()) return;
-    let active = true;
+    if (hasConfiguredBackendForApk()) {
+      let active = true;
 
-    void fetchEngineState()
-      .then((snap) => {
-        if (active && snap) applyEngineSnapshot(snap);
-      })
-      .catch(() => {});
+      void fetchEngineState()
+        .then((snap) => {
+          if (active && snap) applyEngineSnapshot(snap);
+        })
+        .catch(() => {});
 
-    const handle = connectEngineWebSocket({
-      onStatusChange: (connected) => {
-        if (active) setEngineWsConnected(connected);
-      },
-      onMessage: (msg) => {
-        if (!active) return;
-        if (msg.type === 'snapshot' && msg.payload) {
-          applyEngineSnapshot(msg.payload as EngineStateSnapshot);
-        } else if (msg.type === 'mids_tick' && msg.payload) {
-          const mids = msg.payload as Record<string, number>;
-          setMarkets((prev) =>
-            prev.map((m) => {
-              const px = mids[m.coin];
-              if (!px || px <= 0) return m;
-              const change24hPct = m.prevDayPx > 0 ? ((px - m.prevDayPx) / m.prevDayPx) * 100 : m.change24hPct;
-              return { ...m, markPx: px, midPx: px, change24hPct };
-            })
-          );
-          setAccountSummary((prev) => {
-            if (!prev) return prev;
-            return {
-              ...prev,
-              positions: prev.positions.map((pos) => {
-                const px = mids[pos.coin];
-                if (!px || px <= 0 || pos.entryPx <= 0) return pos;
-                const unrealizedPnl =
-                  (pos.side === 'LONG' ? px - pos.entryPx : pos.entryPx - px) * Math.abs(pos.szi);
-                return { ...pos, unrealizedPnl };
-              }),
-            };
-          });
-        } else if (msg.type === 'l2_tick' && msg.payload) {
-          const p = msg.payload as { coin: string; bids: HlL2Level[]; asks: HlL2Level[] };
-          if (p.coin === selectedCoinRef.current) {
-            setL2Book({ bids: p.bids || [], asks: p.asks || [] });
-          }
-        } else if (msg.type === 'candle_tick' && msg.payload) {
-          const p = msg.payload as { coin: string; interval: string; candle: HlCandle };
-          if (p.coin === selectedCoinRef.current && p.interval === intervalRef.current && p.candle) {
-            setCandles((prev) => {
-              const idx = prev.findIndex((c) => c.t === p.candle.t);
-              if (idx >= 0) {
-                const next = [...prev];
-                next[idx] = p.candle;
-                return next;
+      const handle = connectEngineWebSocket({
+        onStatusChange: (connected) => {
+          if (active) setEngineWsConnected(connected);
+        },
+        onMessage: (msg) => {
+          if (!active) return;
+          if (msg.type === 'snapshot' && msg.payload) {
+            applyEngineSnapshot(msg.payload as EngineStateSnapshot);
+          } else if (msg.type === 'mids_tick' && msg.payload) {
+            const mids = msg.payload as Record<string, number>;
+            setMarkets((prev) =>
+              prev.map((m) => {
+                const px = mids[m.coin];
+                if (!px || px <= 0) return m;
+                const change24hPct = m.prevDayPx > 0 ? ((px - m.prevDayPx) / m.prevDayPx) * 100 : m.change24hPct;
+                return { ...m, markPx: px, midPx: px, change24hPct };
+              })
+            );
+            setAccountSummary((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                positions: prev.positions.map((pos) => {
+                  const px = mids[pos.coin];
+                  if (!px || px <= 0 || pos.entryPx <= 0) return pos;
+                  const unrealizedPnl =
+                    (pos.side === 'LONG' ? px - pos.entryPx : pos.entryPx - px) * Math.abs(pos.szi);
+                  return { ...pos, unrealizedPnl };
+                }),
+              };
+            });
+          } else if (msg.type === 'l2_tick' && msg.payload) {
+            const p = msg.payload as { coin: string; bids: HlL2Level[]; asks: HlL2Level[] };
+            if (p.coin === selectedCoinRef.current) {
+              const bids = p.bids || [];
+              const asks = p.asks || [];
+              setL2Book({ bids, asks });
+              setL2Loading(false);
+              if (bids.length > 0 && asks.length > 0) {
+                setL2Error(null);
+                lastLoggedL2ErrorRef.current = null;
+                setL2Source('HL-WS-LIVE');
+                const now = Date.now();
+                setL2UpdatedAtMs(now);
+                l2UpdatedAtMsRef.current = now;
+              } else {
+                setL2Error(`Libro L2 WS vacío para ${p.coin} (${bids.length} bids / ${asks.length} asks)`);
               }
-              return [...prev, p.candle].sort((a, b) => a.t - b.t).slice(-120);
+            }
+          } else if (msg.type === 'candle_tick' && msg.payload) {
+            const p = msg.payload as { coin: string; interval: string; candle: HlCandle };
+            if (p.coin === selectedCoinRef.current && p.interval === intervalRef.current && p.candle) {
+              setCandles((prev) => {
+                const idx = prev.findIndex((c) => c.t === p.candle.t);
+                if (idx >= 0) {
+                  const next = [...prev];
+                  next[idx] = p.candle;
+                  return next;
+                }
+                return [...prev, p.candle].sort((a, b) => a.t - b.t).slice(-120);
+              });
+            }
+          } else if (msg.type === 'log' && msg.payload) {
+            const l = msg.payload as {
+              id: string;
+              level: TradeLogEntry['level'];
+              category: string;
+              coin: string;
+              message: string;
+              latencyMs: number;
+              createdAtMs: number;
+            };
+            setTradeLogs((prev) => {
+              const entry: TradeLogEntry = { ...l, ownerId: 'tug777-engine' };
+              const merged = mergeTradeLogsAdditive([entry], prev);
+              saveLocalLogs(merged);
+              return merged;
             });
           }
-        } else if (msg.type === 'log' && msg.payload) {
-          const l = msg.payload as {
-            id: string;
-            level: TradeLogEntry['level'];
-            category: string;
-            coin: string;
-            message: string;
-            latencyMs: number;
-            createdAtMs: number;
+        },
+      });
+      engineWsHandleRef.current = handle;
+
+      return () => {
+        active = false;
+        engineWsHandleRef.current = null;
+        handle.close();
+      };
+    }
+
+    // Standalone APK / client mode without remote tug777-engine URL: connect directly to Hyperliquid L1 WebSocket!
+    let active = true;
+    const directHandle = connectDirectHyperliquidWs({
+      network: config.network,
+      initialCoin: selectedCoinRef.current,
+      initialInterval: intervalRef.current,
+      onStatusChange: (connected) => {
+        if (!active) return;
+        setEngineWsConnected(connected);
+        setHlChannel(connected ? 'HL-WS-DIRECT' : 'HL-REST-DIRECT');
+      },
+      onMids: (mids, latencyMs) => {
+        if (!active) return;
+        if (latencyMs > 0) setHlLatencyMs(latencyMs);
+        if (Object.keys(mids).length === 0) return;
+        setMarkets((prev) =>
+          prev.map((m) => {
+            const px = mids[m.coin];
+            if (!px || px <= 0) return m;
+            const change24hPct = m.prevDayPx > 0 ? ((px - m.prevDayPx) / m.prevDayPx) * 100 : m.change24hPct;
+            return { ...m, markPx: px, midPx: px, change24hPct };
+          })
+        );
+        setAccountSummary((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            positions: prev.positions.map((pos) => {
+              const px = mids[pos.coin];
+              if (!px || px <= 0 || pos.entryPx <= 0) return pos;
+              const unrealizedPnl =
+                (pos.side === 'LONG' ? px - pos.entryPx : pos.entryPx - px) * Math.abs(pos.szi);
+              return { ...pos, unrealizedPnl };
+            }),
           };
-          setTradeLogs((prev) => {
-            const entry: TradeLogEntry = { ...l, ownerId: 'tug777-engine' };
-            const merged = mergeTradeLogsAdditive([entry], prev);
-            saveLocalLogs(merged);
-            return merged;
-          });
-        }
+        });
+      },
+      onL2Book: (coin, bids, asks) => {
+        if (!active || coin !== selectedCoinRef.current) return;
+        setL2Book({ bids, asks });
+        setL2Error(null);
+        setL2Loading(false);
+        setL2Source('HL-WS-DIRECT');
+        const now = Date.now();
+        setL2UpdatedAtMs(now);
+        l2UpdatedAtMsRef.current = now;
+      },
+      onCandle: (coin, tf, candle) => {
+        if (!active || coin !== selectedCoinRef.current || tf !== intervalRef.current) return;
+        setCandles((prev) => {
+          const idx = prev.findIndex((c) => c.t === candle.t);
+          if (idx >= 0) {
+            const next = [...prev];
+            next[idx] = candle;
+            return next;
+          }
+          return [...prev, candle].sort((a, b) => a.t - b.t).slice(-120);
+        });
+      },
+      onError: (_channel, msg) => {
+        if (!active) return;
+        setL2Error(msg);
       },
     });
-    engineWsHandleRef.current = handle;
+    engineWsHandleRef.current = directHandle;
 
     return () => {
       active = false;
       engineWsHandleRef.current = null;
-      handle.close();
+      directHandle.close();
     };
-  }, [applyEngineSnapshot]);
+  }, [applyEngineSnapshot, config.network]);
 
   // Propagate selected coin / interval to persistent engine WS feed
   useEffect(() => {
@@ -800,21 +918,62 @@ export default function App() {
 
   // Live Candles & L2 Orderbook for selected coin (on coin/tf switch + fallback when WS disconnected)
   const refreshSelectedAssetFeed = useCallback(async () => {
+    const coinAtCall = selectedCoin;
+    setL2Loading(true);
     try {
-      const [cData, bookData] = await Promise.all([
-        fetchCandles(config.network, selectedCoin, interval, 96),
-        fetchL2Book(config.network, selectedCoin),
+      const [candlesRes, l2Res] = await Promise.allSettled([
+        fetchCandles(config.network, coinAtCall, interval, 96),
+        fetchL2Book(config.network, coinAtCall),
       ]);
-      setCandles(cData);
-      setL2Book({ bids: bookData.bids, asks: bookData.asks });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn('Asset feed transient retry:', msg);
+
+      if (candlesRes.status === 'fulfilled') {
+        if (selectedCoinRef.current === coinAtCall) {
+          setCandles(candlesRes.value);
+        }
+      } else {
+        const cErr =
+          candlesRes.reason instanceof Error ? candlesRes.reason.message : String(candlesRes.reason);
+        console.warn(`Candles feed error (${coinAtCall} ${interval}):`, cErr);
+      }
+
+      if (l2Res.status === 'fulfilled') {
+        const bookData = l2Res.value;
+        if (selectedCoinRef.current === coinAtCall) {
+          setL2Book({ bids: bookData.bids, asks: bookData.asks });
+          setL2Error(null);
+          lastLoggedL2ErrorRef.current = null;
+          setL2Source(bookData.channel || 'HL-REST');
+          const now = Date.now();
+          setL2UpdatedAtMs(now);
+          l2UpdatedAtMsRef.current = now;
+        }
+      } else {
+        const errMsg = l2Res.reason instanceof Error ? l2Res.reason.message : String(l2Res.reason);
+        console.warn(`L2 Engine error (${coinAtCall}):`, errMsg);
+        if (selectedCoinRef.current === coinAtCall) {
+          setL2Error(errMsg);
+          const errorSig = `${coinAtCall}:${errMsg}`;
+          if (lastLoggedL2ErrorRef.current !== errorSig) {
+            lastLoggedL2ErrorRef.current = errorSig;
+            void logEventRef.current(
+              'WARN',
+              'L2_ENGINE',
+              coinAtCall,
+              `Falla Motor L2 (${coinAtCall}): ${errMsg}`
+            );
+          }
+        }
+      }
+    } finally {
+      if (selectedCoinRef.current === coinAtCall) {
+        setL2Loading(false);
+      }
     }
   }, [config.network, selectedCoin, interval]);
 
   useEffect(() => {
     setCandlesLoading(true);
+    setL2Error(null);
     void refreshSelectedAssetFeed().finally(() => setCandlesLoading(false));
     const timer = setInterval(() => {
       if (!engineWsConnected) void refreshSelectedAssetFeed();
@@ -1077,6 +1236,7 @@ export default function App() {
     },
     [user]
   );
+  logEventRef.current = logEvent;
 
   const handleSetEngineActive = useCallback(
     async (nextActive: boolean) => {
@@ -1165,7 +1325,7 @@ export default function App() {
         );
         setStatusNotice({
           type: 'error',
-          text: `Dominio "${currentHost}" no autorizado en Firebase Auth. Si usas Droplet/dominio propio, agrégalo en Firebase Console > Authentication > Settings > Authorized domains (${FIREBASE_AUTH_SETTINGS_URL}). Si estás en AI Studio, recarga la página e intenta de nuevo.`,
+          text: `Dominio "${currentHost}" no autorizado en Firebase Auth. Si usas mcloud / dominio propio, agrégalo en Firebase Console > Authentication > Settings > Authorized domains (${FIREBASE_AUTH_SETTINGS_URL}). Si estás en AI Studio, recarga la página e intenta de nuevo.`,
         });
       } else {
         voiceEngine.speak('¡Maldita sea! Falló la entrada con Google, socio.', true);
@@ -1331,12 +1491,32 @@ export default function App() {
     if (!asset) return;
     let freshBids = l2Book.bids;
     let freshAsks = l2Book.asks;
+    let l2AuditErr = '';
     try {
       const fresh = await fetchL2Book(config.network, selectedCoin);
       freshBids = fresh.bids;
       freshAsks = fresh.asks;
-    } catch {
-      // use cached L2 book
+      setL2Book({ bids: fresh.bids, asks: fresh.asks });
+      setL2Error(null);
+      setL2Source(fresh.channel || 'HL-REST');
+      const now = Date.now();
+      setL2UpdatedAtMs(now);
+      l2UpdatedAtMsRef.current = now;
+    } catch (err) {
+      l2AuditErr = err instanceof Error ? err.message : String(err);
+      setL2Error(l2AuditErr);
+      if (freshBids.length === 0 || freshAsks.length === 0) {
+        const failText = `Auditoría MEV en ${selectedCoin} falló — Motor L2 sin libro: ${l2AuditErr}`;
+        await logEvent('ERROR', 'L2_ENGINE', selectedCoin, failText);
+        setStatusNotice({ type: 'error', text: failText });
+        return;
+      }
+      await logEvent(
+        'WARN',
+        'L2_ENGINE',
+        selectedCoin,
+        `L2 vivo falló en auditoría MEV (${l2AuditErr}); usando caché L2 previo.`
+      );
     }
     const audit = auditMevShieldFilters({
       enabled: config.mevShieldEnabled,
@@ -1354,9 +1534,10 @@ export default function App() {
       mevFilterAudit: audit,
       updatedAtMs: Date.now(),
     }));
-    await logEvent('MEV_GUARD', 'MEV_AUDIT', selectedCoin, audit.summary);
+    const finalSummary = l2AuditErr ? `${audit.summary} (caché L2; error vivo: ${l2AuditErr})` : audit.summary;
+    await logEvent('MEV_GUARD', 'MEV_AUDIT', selectedCoin, finalSummary);
     voiceEngine.speak(`Auditoría anti M E V en ${selectedCoin} lista, socio: ${audit.summary}`, true);
-    setStatusNotice({ type: config.mevShieldEnabled ? 'ok' : 'info', text: audit.summary });
+    setStatusNotice({ type: l2AuditErr ? 'info' : config.mevShieldEnabled ? 'ok' : 'info', text: finalSummary });
   }, [
     marketsByCoin,
     selectedCoin,
@@ -1426,11 +1607,45 @@ export default function App() {
       try {
         const activeRoute = getActiveExecutionRoute();
         let freshBook: { bids: HlL2Level[]; asks: HlL2Level[]; latencyMs: number } | null = null;
+        let l2FetchError = '';
         if (!(params.reduceOnly && params.skipL2Precheck)) {
           try {
-            freshBook = await fetchL2Book(config.network, params.coin);
-          } catch {
-            freshBook = null;
+            const book = await fetchL2Book(config.network, params.coin);
+            freshBook = { bids: book.bids, asks: book.asks, latencyMs: book.latencyMs };
+            if (params.coin === selectedCoinRef.current) {
+              setL2Book({ bids: book.bids, asks: book.asks });
+              setL2Error(null);
+              setL2Source(book.channel || 'HL-REST');
+              const now = Date.now();
+              setL2UpdatedAtMs(now);
+              l2UpdatedAtMsRef.current = now;
+            }
+          } catch (l2Err) {
+            l2FetchError = l2Err instanceof Error ? l2Err.message : String(l2Err);
+            if (params.coin === selectedCoinRef.current) {
+              setL2Error(l2FetchError);
+            }
+            if (
+              !params.reduceOnly &&
+              params.coin === selectedCoinRef.current &&
+              l2BookRef.current.bids.length > 0 &&
+              l2BookRef.current.asks.length > 0 &&
+              Date.now() - l2UpdatedAtMsRef.current < 12_000
+            ) {
+              freshBook = {
+                bids: l2BookRef.current.bids,
+                asks: l2BookRef.current.asks,
+                latencyMs: 1,
+              };
+              await logEvent(
+                'WARN',
+                'L2_ENGINE',
+                params.coin,
+                `L2 REST falló (${l2FetchError}); usando snapshot WS L2 reciente (<12s).`
+              );
+            } else {
+              freshBook = null;
+            }
           }
         }
 
@@ -1441,7 +1656,8 @@ export default function App() {
 
         if (!params.reduceOnly) {
           if (!freshBook) {
-            throw new Error(`No se pudo verificar libro L2 en ${activeRoute} para abrir ${params.coin}.`);
+            const errDetail = l2FetchError || 'Libro L2 vacío (0 bids/asks) o sin respuesta';
+            throw new Error(`Motor L2 falló para ${params.coin} (${activeRoute}): ${errDetail}`);
           }
           const mevCheck = evaluateMevShield({
             enabled: config.mevShieldEnabled,
@@ -1545,6 +1761,8 @@ export default function App() {
           referencePx: freshBestPx,
           sizeCoins,
           slippageBps: effectiveSlippageBps,
+          targetLeverage: config.leverage ?? 10,
+          maxLeverage: asset.maxLeverage,
           reduceOnly: params.reduceOnly,
           useAlo: Boolean(config.useAloEntries) && !params.reduceOnly,
           nativeTpsl:
@@ -1738,7 +1956,7 @@ export default function App() {
             size: execResult.filledSz > 0 ? execResult.filledSz : Number(execResult.sizeStr),
             entryPx: entryRef,
             markPx: asset.markPx,
-            leverage: asset.maxLeverage,
+            leverage: Math.max(1, Math.min(Number(config.leverage ?? 10), asset.maxLeverage || 100)),
             unrealizedPnl: 0,
             realizedPnl: 0,
             status: 'OPEN' as const,
@@ -1774,6 +1992,17 @@ export default function App() {
       } catch (err) {
         soundEngine.alert();
         const msg = err instanceof Error ? err.message : String(err);
+        updateOrderTelemetry((prev) => ({
+          ...prev,
+          lastCoin: params.coin,
+          lastSide: params.side,
+          lastStatus: 'REJECTED',
+          lastFillStatus: 'REJECTED',
+          lastRejectReason: msg,
+          lastMevReason: msg,
+          totalRejected: prev.totalRejected + 1,
+          updatedAtMs: Date.now(),
+        }));
         if (!params.reduceOnly && Boolean(config.killSwitchEnabled)) {
           consecutiveExecErrorsRef.current += 1;
           if (consecutiveExecErrorsRef.current >= 3) {
@@ -2177,7 +2406,17 @@ export default function App() {
             });
             lastDeepAnalysesRef.current[c.coin] = evaluated;
             return evaluated;
-          } catch {
+          } catch (scanErr) {
+            const scanErrMsg = scanErr instanceof Error ? scanErr.message : String(scanErr);
+            void logEvent(
+              'WARN',
+              'L2_ENGINE',
+              c.coin,
+              `Error feed/L2 en escaneo (${c.coin}): ${scanErrMsg}`
+            );
+            if (c.coin === selectedCoinRef.current) {
+              setL2Error(scanErrMsg);
+            }
             return evaluateUnifiedDeepSetup({
               market: c,
               candles15m: [],
@@ -3168,7 +3407,7 @@ export default function App() {
         if (!hasConfiguredBackendForApk()) {
           const openCount = accountSummary?.positions.length ?? 0;
           const activeStrats = strategyPlaybook.filter((s) => s.enabled).length;
-          replyText = `¡Órale socio! Aquí en la APK estamos corriendo en modo autónomo con la Guía Unificada y tus ${activeStrats}/10 estrategias activas. ${selectedCoin} cotiza en $${selectedAsset?.markPx?.toFixed(4) ?? '--'} (score ${selectedAsset?.quantScore ?? 0}, ${selectedAsset?.quantBias ?? 'NEUTRAL'}). Tienes ${openCount} posiciones vivas, ${separated.positiveEntryRules.length} reglas SÍ ENTRAR y ${separated.negativeNoEntryRules.length} reglas NO ENTRAR protegiendo la plata. Si quieres usar Gemini o DeepSeek desde tu teléfono, nomás pon tu URL del servidor Droplet en Parámetros IA → Conexión Backend.`;
+          replyText = `¡Órale socio! Aquí en la APK estamos corriendo en modo autónomo con la Guía Unificada y tus ${activeStrats}/10 estrategias activas. ${selectedCoin} cotiza en $${selectedAsset?.markPx?.toFixed(4) ?? '--'} (score ${selectedAsset?.quantScore ?? 0}, ${selectedAsset?.quantBias ?? 'NEUTRAL'}). Tienes ${openCount} posiciones vivas, ${separated.positiveEntryRules.length} reglas SÍ ENTRAR y ${separated.negativeNoEntryRules.length} reglas NO ENTRAR protegiendo la plata. Si quieres usar Gemini o DeepSeek desde tu teléfono, nomás pon tu URL del servidor mcloud / Cloud Run en Parámetros IA → Conexión Backend.`;
         } else {
           const res = await fetch(buildBackendApiUrl('/api/ai/chat'), {
             method: 'POST',
@@ -3311,9 +3550,9 @@ export default function App() {
           setActiveTab('logs');
           voiceEngine.speak('Abriendo bitácora y código de la calle.', true);
           return;
-        case 'NAV_DROPLET':
-          setActiveTab('droplet');
-          voiceEngine.speak('Abriendo el cuartel veinticuatro siete en Droplet.', true);
+        case 'NAV_MCLOUD':
+          setActiveTab('mcloud');
+          voiceEngine.speak('Abriendo tu infraestructura veinticuatro siete en mcloud, socio.', true);
           return;
         case 'SYNC_POSITIONS':
           voiceEngine.speak('Sincronizando cuentas con Hyperliquid, socio.', true);
@@ -3430,11 +3669,11 @@ export default function App() {
 
   const handleApkAction = async () => {
     soundEngine.tradeExecuted();
-    voiceEngine.speak('¡Descargando el A P K de T U G 777 para tu teléfono, socio! El mundo es tuyo.', true);
+    voiceEngine.speak('¡Descargando el A P K actualizado versión tres punto cinco de T U G 777, socio! El mundo es tuyo.', true);
     await downloadAndroidApkKit(window.location.origin);
     setStatusNotice({
       type: 'ok',
-      text: 'Descargando TUG777-HyperTrade.apk (APK real firmado v3.4.0). Ábrelo en tu Android y permite "Instalar apps desconocidas" para instalarlo.',
+      text: 'Descargando TUG777-HyperTrade.apk (v3.5.0 con mcloud, 10x, Motor L2 y HL-WS Directo). Si ya tenías instalada la v3.2.0 anterior, desinstálala primero antes de instalar esta nueva.',
     });
   };
 
@@ -3465,9 +3704,12 @@ export default function App() {
             777
           </span>
           <span className="text-lg font-extrabold tracking-tight text-slate-100">TUG777</span>
+          <span className="px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700 text-[10px] font-mono text-amber-300">
+            v3.5.0
+          </span>
         </a>
 
-        {/* Zone 2: Clean Single-Line Navigation Links (including separate Droplet 24/7 tab) */}
+        {/* Zone 2: Clean Single-Line Navigation Links (including separate mcloud 24/7 tab) */}
         <nav className="hidden md:flex items-center gap-6 text-sm font-medium">
           {(
             [
@@ -3475,7 +3717,7 @@ export default function App() {
               { id: 'positions', label: 'Posiciones' },
               { id: 'pnl', label: 'PnL' },
               { id: 'logs', label: 'Logs' },
-              { id: 'droplet', label: 'Droplet 24/7' },
+              { id: 'mcloud', label: 'mcloud 24/7' },
             ] as const
           ).map((tab) => (
             <button
@@ -3523,7 +3765,7 @@ export default function App() {
             { id: 'positions', label: 'Posiciones' },
             { id: 'pnl', label: 'PnL' },
             { id: 'logs', label: 'Logs' },
-            { id: 'droplet', label: 'Droplet 24/7' },
+            { id: 'mcloud', label: 'mcloud 24/7' },
           ] as const
         ).map((tab) => (
           <button
@@ -3595,6 +3837,10 @@ export default function App() {
                 <span>
                   Escaneados: {engineSnapshot?.scannedTokenCount || markets.length} · Watchlist:{' '}
                   {(config.watchlistCoinsCsv || 'BTC,ETH,SOL,HYPE').split(',').filter(Boolean).length}
+                </span>
+                <span aria-hidden="true">·</span>
+                <span className="text-amber-300 font-semibold">
+                  Lev {Math.max(1, Number(config.leverage ?? 10))}x
                 </span>
               </div>
             </div>
@@ -3762,6 +4008,20 @@ export default function App() {
                 <Download className="w-3.5 h-3.5" />
                 Descargar APK
               </button>
+
+              {isInstallable && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    soundEngine.click();
+                    void triggerPwaInstall();
+                  }}
+                  className="px-3.5 py-2.5 rounded-md bg-emerald-600/20 border border-emerald-500/40 hover:bg-emerald-600/30 text-xs font-semibold text-emerald-300 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Instalar PWA v3.5
+                </button>
+              )}
 
               {/* Hands-Free Voice Command Mic Toggle */}
               <button
@@ -4269,6 +4529,12 @@ export default function App() {
                       asset={selectedAsset}
                       bids={l2Book.bids}
                       asks={l2Book.asks}
+                      leverage={config.leverage ?? 10}
+                      l2Error={l2Error}
+                      l2Loading={l2Loading}
+                      l2Source={l2Source}
+                      l2UpdatedAtMs={l2UpdatedAtMs}
+                      onRetryL2={() => void refreshSelectedAssetFeed()}
                       hasApiKey={Boolean(apiPrivateKey.trim())}
                       mevShieldEnabled={config.mevShieldEnabled}
                       activeRoute={orderTelemetry.activeRoute}
@@ -4489,8 +4755,18 @@ export default function App() {
           />
         )}
 
-        {activeTab === 'droplet' && (
-          <DropletDeployView
+        {activeTab === 'mcloud' && (
+          <McloudInfraView
+            config={config}
+            engineSnapshot={engineSnapshot}
+            onSaveMcloudConfig={async (patch) => {
+              await updateConfigPatch(patch);
+              setStatusNotice({
+                type: 'ok',
+                text: `Infraestructura mcloud actualizada (${patch.mcloudEnabled ? 'ACTIVA' : 'DESACTIVADA'} → ${patch.mcloudUrl}) · Motor en PAUSA segura.`,
+              });
+            }}
+            onApplyEngineSnapshot={applyEngineSnapshot}
             isInstallable={isInstallable}
             onTriggerPwaInstall={() => void triggerPwaInstall()}
           />

@@ -7,6 +7,7 @@ export interface HyperliquidWsCallbacks {
   onCandle: (coin: string, interval: string, candle: HlCandle, ts: number) => void;
   onUserEvents: (events: unknown, ts: number) => void;
   onStatusChange: (status: { connected: boolean; wsUrl: string; wsLatencyMs: number; reason?: string }) => void;
+  onError?: (channel: string, detail: string, ts: number) => void;
 }
 
 export class HyperliquidWsClient {
@@ -187,6 +188,12 @@ export class HyperliquidWsClient {
         return;
       }
 
+      if (msg.channel === 'error') {
+        const detail = typeof msg.data === 'string' ? msg.data : JSON.stringify(msg.data ?? 'WS error');
+        this.callbacks.onError?.('ws', detail, now);
+        return;
+      }
+
       if (msg.channel === 'l2Book') {
         const d = msg.data as {
           coin?: string;
@@ -196,17 +203,33 @@ export class HyperliquidWsClient {
           ];
         };
         if (d?.coin && Array.isArray(d.levels)) {
-          const bids = (d.levels[0] || []).slice(0, 12).map((l) => ({
-            px: Number(l.px),
-            sz: Number(l.sz),
-            n: l.n,
-          }));
-          const asks = (d.levels[1] || []).slice(0, 12).map((l) => ({
-            px: Number(l.px),
-            sz: Number(l.sz),
-            n: l.n,
-          }));
-          this.callbacks.onL2Book(d.coin, bids, asks, now);
+          const bids = (d.levels[0] || [])
+            .slice(0, 12)
+            .map((l) => ({
+              px: Number(l.px),
+              sz: Number(l.sz),
+              n: l.n,
+            }))
+            .filter((l) => Number.isFinite(l.px) && l.px > 0 && Number.isFinite(l.sz) && l.sz > 0);
+          const asks = (d.levels[1] || [])
+            .slice(0, 12)
+            .map((l) => ({
+              px: Number(l.px),
+              sz: Number(l.sz),
+              n: l.n,
+            }))
+            .filter((l) => Number.isFinite(l.px) && l.px > 0 && Number.isFinite(l.sz) && l.sz > 0);
+          if (bids.length === 0 && asks.length === 0) {
+            this.callbacks.onError?.('l2Book', `Libro L2 WS vacío (0 bids / 0 asks) para ${d.coin}.`, now);
+          } else {
+            this.callbacks.onL2Book(d.coin, bids, asks, now);
+          }
+        } else {
+          this.callbacks.onError?.(
+            'l2Book',
+            `Frame l2Book inválido desde Hyperliquid WS${d?.coin ? ` (${d.coin})` : ''}.`,
+            now
+          );
         }
         return;
       }

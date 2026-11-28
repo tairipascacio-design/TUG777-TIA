@@ -91,6 +91,7 @@ export const DEFAULT_CONFIG = (uid: string): BotConfigData => ({
   sizingMode: 'equity_pct',
   capitalPctPerTrade: 15,
   maxOpenPositions: 2,
+  leverage: 10,
   trailingStopEnabled: true,
   autoManagePositions: true,
   riskPerTradePct: 0.35,
@@ -176,6 +177,7 @@ export async function ensureUserProfileAndConfig(user: {
       sizingMode: d.sizingMode === 'fixed_usd' ? 'fixed_usd' : 'equity_pct',
       capitalPctPerTrade: Number(d.capitalPctPerTrade ?? defaults.capitalPctPerTrade),
       maxOpenPositions: Number(d.maxOpenPositions ?? defaults.maxOpenPositions),
+      leverage: Number(d.leverage ?? defaults.leverage ?? 10),
       trailingStopEnabled: d.trailingStopEnabled !== false,
       autoManagePositions: d.autoManagePositions !== false,
       riskPerTradePct: Number(d.riskPerTradePct ?? defaults.riskPerTradePct),
@@ -234,6 +236,7 @@ export async function saveBotConfig(uid: string, patch: Partial<BotConfigData>) 
     'sizingMode',
     'capitalPctPerTrade',
     'maxOpenPositions',
+    'leverage',
     'trailingStopEnabled',
     'autoManagePositions',
     'riskPerTradePct',
@@ -300,6 +303,9 @@ export async function saveBotConfig(uid: string, patch: Partial<BotConfigData>) 
   }
   if (typeof sanitized.maxOpenPositions === 'number') {
     sanitized.maxOpenPositions = Math.max(1, Math.min(20, Math.round(sanitized.maxOpenPositions)));
+  }
+  if (typeof sanitized.leverage === 'number') {
+    sanitized.leverage = Math.max(1, Math.min(100, Math.round(sanitized.leverage)));
   }
   if (typeof sanitized.riskPerTradePct === 'number') {
     sanitized.riskPerTradePct = Math.max(0.05, Math.min(25, sanitized.riskPerTradePct));

@@ -10,7 +10,7 @@ export interface ParsedVoiceCommand {
     | 'NAV_POSITIONS'
     | 'NAV_PNL'
     | 'NAV_LOGS'
-    | 'NAV_DROPLET'
+    | 'NAV_MCLOUD'
     | 'SYNC_POSITIONS'
     | 'SAVE_CONFIG'
     | 'OPEN_API_MODAL'
@@ -496,8 +496,8 @@ class VoiceAssistantEngine {
     if (/(abre|ve a|ir a|muestra|ver).*(logs|registros|memoria)/.test(lower)) {
       return { type: 'NAV_LOGS', rawText };
     }
-    if (/(abre|ve a|ir a|muestra|ver).*(droplet|servidor|24)/.test(lower)) {
-      return { type: 'NAV_DROPLET', rawText };
+    if (/(abre|ve a|ir a|muestra|ver).*(mcloud|mcliud|nube|droplet|servidor|24)/.test(lower)) {
+      return { type: 'NAV_MCLOUD', rawText };
     }
     if (/(abre|ve a|ir a|muestra|ver).*(terminal|grafica|inicio|principal)/.test(lower)) {
       return { type: 'NAV_TERMINAL', rawText };

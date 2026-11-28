@@ -279,6 +279,7 @@ export function validateAndPrepareOrderSize(params: {
 
 let sessionSignerKey = (process.env.HL_API_PRIVATE_KEY || '').trim();
 let lastHlOrderNonce = 0;
+const syncedLeverageCache = new Map<string, number>();
 
 export function setBackendSignerKey(privateKey: string) {
   const cleaned = privateKey.trim();
@@ -497,6 +498,43 @@ async function signAndPostHyperliquidAction(
   }
 }
 
+export async function syncHyperliquidLeverage(params: {
+  network: HlNetwork;
+  assetIndex: number;
+  leverage: number;
+  maxLeverage?: number;
+  isCross?: boolean;
+}): Promise<{ ok: boolean; appliedLeverage: number; error?: string }> {
+  if (!sessionSignerKey) {
+    return { ok: false, appliedLeverage: params.leverage, error: 'Signer no configurado' };
+  }
+  const maxAllowed = Math.max(1, Math.min(100, Math.round(params.maxLeverage || 50)));
+  const clamped = Math.max(1, Math.min(maxAllowed, Math.round(params.leverage || 10)));
+  const cacheKey = `${params.network}:${getBackendSignerAddress() || 'default'}:${params.assetIndex}`;
+  if (syncedLeverageCache.get(cacheKey) === clamped) {
+    return { ok: true, appliedLeverage: clamped };
+  }
+  try {
+    const res = await signAndPostHyperliquidAction(params.network, {
+      type: 'updateLeverage',
+      asset: params.assetIndex,
+      isCross: params.isCross !== false,
+      leverage: clamped,
+    });
+    if (res.fillStatus === 'REJECTED' && res.rejectReason) {
+      return { ok: false, appliedLeverage: clamped, error: res.rejectReason };
+    }
+    syncedLeverageCache.set(cacheKey, clamped);
+    return { ok: true, appliedLeverage: clamped };
+  } catch (err) {
+    return {
+      ok: false,
+      appliedLeverage: clamped,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 export async function submitEntryWithNativeTpsl(params: {
   network: HlNetwork;
   coin: string;
@@ -512,10 +550,21 @@ export async function submitEntryWithNativeTpsl(params: {
   tp1Pct?: number;
   tp2Pct?: number;
   useAloEntries: boolean;
+  targetLeverage?: number;
+  maxLeverage?: number;
   strategyTag?: string;
   strategies?: string[];
 }) {
   return withSymbolLock(params.coin, async () => {
+    if (params.targetLeverage && params.targetLeverage >= 1) {
+      await syncHyperliquidLeverage({
+        network: params.network,
+        assetIndex: params.assetIndex,
+        leverage: params.targetLeverage,
+        maxLeverage: params.maxLeverage,
+        isCross: true,
+      });
+    }
     const prep = validateAndPrepareOrderSize({
       desiredNotionalUsd: params.desiredNotionalUsd,
       minOrderUsdFloor: params.minOrderUsdFloor,

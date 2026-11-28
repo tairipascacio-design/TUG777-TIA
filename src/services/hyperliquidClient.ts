@@ -197,6 +197,200 @@ export function connectEngineWebSocket(handlers: {
   };
 }
 
+export function connectDirectHyperliquidWs(params: {
+  network: HlNetwork;
+  initialCoin: string;
+  initialInterval: '1m' | '5m' | '15m' | '1h' | '4h';
+  onStatusChange?: (connected: boolean) => void;
+  onMids?: (mids: Record<string, number>, latencyMs: number) => void;
+  onL2Book?: (coin: string, bids: HlL2Level[], asks: HlL2Level[]) => void;
+  onCandle?: (coin: string, interval: string, candle: HlCandle) => void;
+  onError?: (channel: string, message: string) => void;
+}): { close: () => void; sendSelectFeed: (coin: string, interval: '1m' | '5m' | '15m' | '1h' | '4h') => void } {
+  let ws: WebSocket | null = null;
+  let closedByCaller = false;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let pingTimer: ReturnType<typeof setInterval> | null = null;
+  let attempt = 0;
+  let activeCoin = params.initialCoin || 'BTC';
+  let activeInterval = params.initialInterval || '15m';
+  let lastPingSentAt = 0;
+
+  const wsUrl =
+    params.network === 'testnet'
+      ? 'wss://api.hyperliquid-testnet.xyz/ws'
+      : 'wss://api.hyperliquid.xyz/ws';
+
+  const sendSub = (method: 'subscribe' | 'unsubscribe', subscription: Record<string, unknown>) => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ method, subscription }));
+    }
+  };
+
+  const clearTimers = () => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (pingTimer) {
+      clearInterval(pingTimer);
+      pingTimer = null;
+    }
+  };
+
+  const connect = () => {
+    if (closedByCaller || typeof window === 'undefined') return;
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      params.onStatusChange?.(false);
+      params.onError?.('hlWs', err instanceof Error ? err.message : String(err));
+      return;
+    }
+
+    ws.onopen = () => {
+      attempt = 0;
+      params.onStatusChange?.(true);
+      sendSub('subscribe', { type: 'allMids' });
+      sendSub('subscribe', { type: 'l2Book', coin: activeCoin });
+      sendSub('subscribe', { type: 'candle', coin: activeCoin, interval: activeInterval });
+      lastPingSentAt = performance.now();
+      ws?.send(JSON.stringify({ method: 'ping' }));
+      pingTimer = setInterval(() => {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          lastPingSentAt = performance.now();
+          ws.send(JSON.stringify({ method: 'ping' }));
+        }
+      }, 20_000);
+    };
+
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(String(ev.data)) as { channel?: string; data?: unknown };
+        if (msg.channel === 'pong') {
+          const rtt = lastPingSentAt > 0 ? Math.max(1, Math.round(performance.now() - lastPingSentAt)) : 0;
+          if (rtt > 0) params.onMids?.({}, rtt);
+          return;
+        }
+        if (msg.channel === 'error') {
+          const errText =
+            typeof msg.data === 'string' ? msg.data : JSON.stringify(msg.data || 'Error WS Hyperliquid');
+          params.onError?.('hlWs', errText);
+          return;
+        }
+        if (msg.channel === 'allMids' && msg.data && typeof msg.data === 'object') {
+          const rawMids = (msg.data as { mids?: Record<string, string> }).mids || {};
+          const parsed: Record<string, number> = {};
+          for (const [k, v] of Object.entries(rawMids)) {
+            const n = Number(v);
+            if (Number.isFinite(n) && n > 0) parsed[k] = n;
+          }
+          const rtt = lastPingSentAt > 0 ? Math.max(1, Math.round(performance.now() - lastPingSentAt)) : 0;
+          params.onMids?.(parsed, rtt);
+          return;
+        }
+        if (msg.channel === 'l2Book' && msg.data && typeof msg.data === 'object') {
+          const d = msg.data as {
+            coin?: string;
+            levels?: [Array<{ px: string; sz: string; n: number }>, Array<{ px: string; sz: string; n: number }>];
+          };
+          const coin = d.coin || activeCoin;
+          if (!Array.isArray(d.levels) || d.levels.length < 2) {
+            params.onError?.('l2Book', `Respuesta WS l2Book inválida para ${coin}`);
+            return;
+          }
+          const mapLevels = (arr: Array<{ px: string; sz: string; n: number }>) =>
+            (arr || [])
+              .map((lv) => ({ px: Number(lv.px), sz: Number(lv.sz), n: Number(lv.n || 1) }))
+              .filter((lv) => Number.isFinite(lv.px) && lv.px > 0 && Number.isFinite(lv.sz) && lv.sz > 0);
+          const bids = mapLevels(d.levels[0]);
+          const asks = mapLevels(d.levels[1]);
+          if (bids.length === 0 || asks.length === 0) {
+            params.onError?.('l2Book', `Libro L2 WS vacío para ${coin} (${bids.length} bids / ${asks.length} asks)`);
+            return;
+          }
+          params.onL2Book?.(coin, bids, asks);
+          return;
+        }
+        if (msg.channel === 'candle' && msg.data && typeof msg.data === 'object') {
+          const c = msg.data as {
+            s?: string;
+            i?: string;
+            t?: number;
+            T?: number;
+            o?: string;
+            h?: string;
+            l?: string;
+            c?: string;
+            v?: string;
+            n?: number;
+          };
+          const coin = c.s || activeCoin;
+          const tf = c.i || activeInterval;
+          if (c.t && c.c) {
+            params.onCandle?.(coin, tf, {
+              t: Number(c.t),
+              T: Number(c.T || c.t),
+              s: coin,
+              i: tf,
+              o: Number(c.o || 0),
+              h: Number(c.h || 0),
+              l: Number(c.l || 0),
+              c: Number(c.c || 0),
+              v: Number(c.v || 0),
+              n: Number(c.n || 0),
+            });
+          }
+        }
+      } catch {
+        // ignore malformed frame
+      }
+    };
+
+    ws.onclose = () => {
+      clearTimers();
+      params.onStatusChange?.(false);
+      if (!closedByCaller) {
+        const delay = Math.min(20_000, 1200 * Math.pow(2, Math.min(attempt, 4)));
+        attempt += 1;
+        reconnectTimer = setTimeout(connect, delay);
+      }
+    };
+
+    ws.onerror = () => {
+      params.onStatusChange?.(false);
+      params.onError?.('hlWs', `Error de conexión WebSocket directo (${wsUrl})`);
+    };
+  };
+
+  connect();
+
+  return {
+    close: () => {
+      closedByCaller = true;
+      clearTimers();
+      if (ws) {
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+      }
+    },
+    sendSelectFeed: (coin: string, interval: '1m' | '5m' | '15m' | '1h' | '4h') => {
+      const nextCoin = coin || activeCoin;
+      const nextInterval = interval || activeInterval;
+      if (nextCoin === activeCoin && nextInterval === activeInterval) return;
+      sendSub('unsubscribe', { type: 'l2Book', coin: activeCoin });
+      sendSub('unsubscribe', { type: 'candle', coin: activeCoin, interval: activeInterval });
+      activeCoin = nextCoin;
+      activeInterval = nextInterval;
+      sendSub('subscribe', { type: 'l2Book', coin: activeCoin });
+      sendSub('subscribe', { type: 'candle', coin: activeCoin, interval: activeInterval });
+    },
+  };
+}
+
 async function parseJsonSafe<T = unknown>(res: Response): Promise<T> {
   const text = await res.text();
   const trimmed = text.trim();
@@ -253,7 +447,76 @@ export async function testMcloudConnection(mcloudUrl?: string): Promise<{
   hmacConfigured: boolean;
   detail: string;
 }> {
+  const cleanBase = (mcloudUrl || 'https://mcloud-1036926196544.us-east1.run.app').trim().replace(/\/+$/, '');
+  if (!hasConfiguredBackendForApk()) {
+    return {
+      ok: false,
+      baseUrl: cleanBase,
+      healthStatus: 0,
+      healthLatencyMs: 0,
+      contextStatus: 0,
+      contextLatencyMs: 0,
+      webhookStatus: 0,
+      webhookLatencyMs: 0,
+      hmacConfigured: false,
+      detail:
+        'APK sin servidor relay tug777-engine configurado: mcloud bloquea peticiones directas del navegador (CORS). Configura la URL HTTPS de tu tug777-engine arriba para enlazar mcloud desde fuera de AI Studio; Hyperliquid L1 + WS Directo siguen activos al 100%.',
+    };
+  }
   const res = await fetch(buildBackendApiUrl('/api/mcloud/test'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify({ mcloudUrl }),
+  });
+  return parseJsonSafe(res);
+}
+
+export async function fetchMcloudContextFromServer(mcloudUrl?: string): Promise<{
+  ok: boolean;
+  status: number;
+  latencyMs: number;
+  baseUrl: string;
+  data: unknown | null;
+  error?: string;
+}> {
+  const cleanBase = (mcloudUrl || 'https://mcloud-1036926196544.us-east1.run.app').trim().replace(/\/+$/, '');
+  if (!hasConfiguredBackendForApk()) {
+    return {
+      ok: false,
+      status: 0,
+      latencyMs: 0,
+      baseUrl: cleanBase,
+      data: null,
+      error:
+        'Se requiere URL de servidor tug777-engine para leer KV de mcloud sin exponer MCLOUD_API_KEY ni chocar con CORS en el APK.',
+    };
+  }
+  const q = mcloudUrl ? `?url=${encodeURIComponent(mcloudUrl)}` : '';
+  const res = await fetch(buildBackendApiUrl(`/api/mcloud/context${q}`), {
+    headers: { Accept: 'application/json' },
+  });
+  return parseJsonSafe(res);
+}
+
+export async function syncMcloudStateFromServer(mcloudUrl?: string): Promise<{
+  ok: boolean;
+  baseUrl: string;
+  webhookResult: { ok: boolean; status: number; latencyMs: number; error?: string };
+  kvResult: { ok: boolean; status: number; latencyMs: number; error?: string };
+  snapshot?: EngineStateSnapshot;
+}> {
+  const cleanBase = (mcloudUrl || 'https://mcloud-1036926196544.us-east1.run.app').trim().replace(/\/+$/, '');
+  if (!hasConfiguredBackendForApk()) {
+    const errMsg =
+      'APK sin servidor tug777-engine configurado (mcloud bloquea CORS directo). Configura tu URL tug777-engine arriba para sincronizar vía servidor.';
+    return {
+      ok: false,
+      baseUrl: cleanBase,
+      webhookResult: { ok: false, status: 0, latencyMs: 0, error: errMsg },
+      kvResult: { ok: false, status: 0, latencyMs: 0, error: errMsg },
+    };
+  }
+  const res = await fetch(buildBackendApiUrl('/api/mcloud/sync-state'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({ mcloudUrl }),
@@ -274,6 +537,17 @@ export function getActiveExecutionRoute(): HlExecutionRoute {
   return directExchangeHealthy ? 'HL-DIRECT-L1' : 'HL-EXCHANGE-L1';
 }
 
+function normalizeHlTransportError(err: unknown, contextLabel: string, timeoutMs?: number): Error {
+  if (err instanceof Error && err.name === 'AbortError') {
+    return new Error(`Timeout ${timeoutMs ?? 5000}ms (${contextLabel})`);
+  }
+  const raw = err instanceof Error ? err.message : String(err);
+  if (/aborted/i.test(raw)) {
+    return new Error(`Timeout ${timeoutMs ?? 5000}ms (${contextLabel})`);
+  }
+  return err instanceof Error ? err : new Error(raw);
+}
+
 async function fetchDirectHlInfo<T>(network: HlNetwork, payload: Record<string, unknown>, timeoutMs = 4000) {
   const t0 = performance.now();
   const controller = new AbortController();
@@ -287,7 +561,7 @@ async function fetchDirectHlInfo<T>(network: HlNetwork, payload: Record<string, 
     });
     if (!directRes.ok) {
       const errText = await directRes.text();
-      throw new Error(`Hyperliquid Direct HTTP ${directRes.status}: ${errText.slice(0, 200)}`);
+      throw new Error(`HL Direct HTTP ${directRes.status}: ${errText.slice(0, 200)}`);
     }
     const data = await parseJsonSafe<T>(directRes);
     const latencyMs = Math.round(performance.now() - t0);
@@ -297,6 +571,8 @@ async function fetchDirectHlInfo<T>(network: HlNetwork, payload: Record<string, 
       latencyMs,
       channel: 'HL-DIRECT-L1',
     };
+  } catch (err) {
+    throw normalizeHlTransportError(err, 'HL Direct', timeoutMs);
   } finally {
     clearTimeout(timer);
   }
@@ -315,7 +591,7 @@ async function fetchProxyHlInfo<T>(network: HlNetwork, payload: Record<string, u
     });
     const json = await parseJsonSafe<{ data: T; latencyMs: number; channel: string; error?: string }>(res);
     if (!res.ok) {
-      throw new Error(json?.error || `Hyperliquid HTTP ${res.status}`);
+      throw new Error(json?.error || `HL Proxy HTTP ${res.status}`);
     }
     const totalMs = Math.round(performance.now() - t0);
     lastProxyRttMs = totalMs;
@@ -323,19 +599,30 @@ async function fetchProxyHlInfo<T>(network: HlNetwork, payload: Record<string, u
       ...json,
       latencyMs: Math.min(totalMs, json.latencyMs || totalMs),
     };
+  } catch (err) {
+    throw normalizeHlTransportError(err, 'HL Proxy', timeoutMs);
   } finally {
     clearTimeout(timer);
   }
 }
 
-function formatHlRaceError(err: unknown): Error {
-  if (typeof AggregateError !== 'undefined' && err instanceof AggregateError) {
-    const msgs = err.errors
-      .map((e) => (e instanceof Error ? e.message : String(e)))
-      .filter(Boolean);
-    return new Error(msgs.length > 0 ? msgs.join(' | ') : 'Hyperliquid no respondió');
-  }
-  return err instanceof Error ? err : new Error(String(err));
+function formatHlRaceError(err: unknown, retryErr?: unknown): Error {
+  const parts: string[] = [];
+  const collect = (e: unknown) => {
+    if (!e) return;
+    if (typeof AggregateError !== 'undefined' && e instanceof AggregateError) {
+      for (const sub of e.errors) {
+        const m = sub instanceof Error ? sub.message : String(sub);
+        if (m && !parts.includes(m)) parts.push(m);
+      }
+      return;
+    }
+    const m = e instanceof Error ? e.message : String(e);
+    if (m && !parts.includes(m)) parts.push(m);
+  };
+  collect(err);
+  collect(retryErr);
+  return new Error(parts.length > 0 ? parts.join(' | ') : 'Hyperliquid no respondió');
 }
 
 export async function hlInfoRequest<T = unknown>(
@@ -352,8 +639,8 @@ export async function hlInfoRequest<T = unknown>(
       await new Promise((r) => setTimeout(r, 250));
       try {
         return await fetchProxyHlInfo<T>(network, payload, 5000);
-      } catch {
-        throw formatHlRaceError(firstErr);
+      } catch (retryErr) {
+        throw formatHlRaceError(firstErr, retryErr);
       }
     }
   }
@@ -363,8 +650,8 @@ export async function hlInfoRequest<T = unknown>(
     await new Promise((r) => setTimeout(r, 250));
     try {
       return await fetchDirectHlInfo<T>(network, payload, 4500);
-    } catch {
-      throw formatHlRaceError(err);
+    } catch (retryErr) {
+      throw formatHlRaceError(err, retryErr);
     }
   }
 }
@@ -571,25 +858,37 @@ export async function fetchCandles(
 export async function fetchL2Book(
   network: HlNetwork,
   coin: string
-): Promise<{ bids: HlL2Level[]; asks: HlL2Level[]; latencyMs: number }> {
+): Promise<{ bids: HlL2Level[]; asks: HlL2Level[]; latencyMs: number; channel: string }> {
   type L2Response = {
-    levels: [
+    levels?: [
       Array<{ px: string; sz: string; n: number }>,
       Array<{ px: string; sz: string; n: number }>
     ];
-  };
-  const { data, latencyMs } = await hlInfoRequest<L2Response>(network, { type: 'l2Book', coin });
-  const bids = (data?.levels?.[0] || []).slice(0, 12).map((l) => ({
-    px: Number(l.px),
-    sz: Number(l.sz),
-    n: l.n,
-  }));
-  const asks = (data?.levels?.[1] || []).slice(0, 12).map((l) => ({
-    px: Number(l.px),
-    sz: Number(l.sz),
-    n: l.n,
-  }));
-  return { bids, asks, latencyMs };
+  } | null;
+  const { data, latencyMs, channel } = await hlInfoRequest<L2Response>(network, { type: 'l2Book', coin });
+  if (!data || !Array.isArray(data.levels)) {
+    throw new Error(`Libro L2 nulo o inválido para ${coin} en Hyperliquid (${network}).`);
+  }
+  const bids = (data.levels[0] || [])
+    .slice(0, 12)
+    .map((l) => ({
+      px: Number(l.px),
+      sz: Number(l.sz),
+      n: l.n,
+    }))
+    .filter((l) => Number.isFinite(l.px) && l.px > 0 && Number.isFinite(l.sz) && l.sz > 0);
+  const asks = (data.levels[1] || [])
+    .slice(0, 12)
+    .map((l) => ({
+      px: Number(l.px),
+      sz: Number(l.sz),
+      n: l.n,
+    }))
+    .filter((l) => Number.isFinite(l.px) && l.px > 0 && Number.isFinite(l.sz) && l.sz > 0);
+  if (bids.length === 0 && asks.length === 0) {
+    throw new Error(`Libro L2 vacío (0 bids / 0 asks) para ${coin} en Hyperliquid (${network}).`);
+  }
+  return { bids, asks, latencyMs, channel };
 }
 
 export async function resolveMasterFromAgentKey(
@@ -946,6 +1245,109 @@ function nextMonotonicHlNonce(): number {
   return base;
 }
 
+const clientLeverageSyncCache = new Map<string, number>();
+
+async function signHlExchangeAction(network: HlNetwork, wallet: Wallet, action: Record<string, unknown>) {
+  const nonce = nextMonotonicHlNonce();
+  const msgPackBytes = encode(action);
+  const nonceBytes = new Uint8Array(8);
+  const view = new DataView(nonceBytes.buffer);
+  view.setBigUint64(0, BigInt(nonce), false);
+  const vaultFlag = new Uint8Array([0x00]);
+  const connectionId = keccak256(concat([msgPackBytes, nonceBytes, vaultFlag]));
+
+  const domain = {
+    name: 'Exchange',
+    version: '1',
+    chainId: 1337,
+    verifyingContract: '0x0000000000000000000000000000000000000000',
+  };
+  const types = {
+    Agent: [
+      { name: 'source', type: 'string' },
+      { name: 'connectionId', type: 'bytes32' },
+    ],
+  };
+  const message = {
+    source: network === 'mainnet' ? 'a' : 'b',
+    connectionId,
+  };
+
+  const signStartedAt = performance.now();
+  const rawSig = await wallet.signTypedData(domain, types, message);
+  const sig = Signature.from(rawSig);
+  const signMs = Math.max(1, Math.round(performance.now() - signStartedAt));
+
+  return {
+    signMs,
+    signedPayload: {
+      action,
+      nonce,
+      signature: {
+        r: sig.r,
+        s: sig.s,
+        v: sig.v,
+      },
+    },
+  };
+}
+
+export async function syncClientHyperliquidLeverage(params: {
+  network: HlNetwork;
+  apiPrivateKey: string;
+  assetIndex: number;
+  leverage: number;
+  maxLeverage?: number;
+  isCross?: boolean;
+}): Promise<{ ok: boolean; appliedLeverage: number; error?: string }> {
+  const wallet = new Wallet(params.apiPrivateKey.trim());
+  const maxAllowed = Math.max(1, Math.min(100, Math.round(params.maxLeverage || 50)));
+  const clamped = Math.max(1, Math.min(maxAllowed, Math.round(params.leverage || 10)));
+  const cacheKey = `${params.network}:${wallet.address}:${params.assetIndex}`;
+  if (clientLeverageSyncCache.get(cacheKey) === clamped) {
+    return { ok: true, appliedLeverage: clamped };
+  }
+  const { signedPayload } = await signHlExchangeAction(params.network, wallet, {
+    type: 'updateLeverage',
+    asset: params.assetIndex,
+    isCross: params.isCross !== false,
+    leverage: clamped,
+  });
+  try {
+    const res = await fetch(`${HL_DIRECT_BASE[params.network]}/exchange`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(signedPayload),
+    });
+    if (res.ok) {
+      const json = (await res.json()) as { status?: string; response?: string };
+      if (json?.status === 'err') {
+        return { ok: false, appliedLeverage: clamped, error: String(json.response || 'Error updateLeverage') };
+      }
+      clientLeverageSyncCache.set(cacheKey, clamped);
+      return { ok: true, appliedLeverage: clamped };
+    }
+  } catch {
+    // Fall through to backend relay if available
+  }
+  if (shouldUseBackendProxy()) {
+    try {
+      const proxyRes = await fetch(buildBackendApiUrl('/api/hl/exchange'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ network: params.network, signedPayload }),
+      });
+      if (proxyRes.ok) {
+        clientLeverageSyncCache.set(cacheKey, clamped);
+        return { ok: true, appliedLeverage: clamped };
+      }
+    } catch {
+      // ignore fallback failure
+    }
+  }
+  return { ok: false, appliedLeverage: clamped, error: 'No se pudo actualizar apalancamiento en Hyperliquid' };
+}
+
 export async function executeRealHyperliquidOrder(params: {
   network: HlNetwork;
   apiPrivateKey: string;
@@ -957,9 +1359,21 @@ export async function executeRealHyperliquidOrder(params: {
   slippageBps: number;
   reduceOnly?: boolean;
   useAlo?: boolean;
+  targetLeverage?: number;
+  maxLeverage?: number;
   nativeTpsl?: { slPct: number; tpPct: number };
 }) {
   const wallet = new Wallet(params.apiPrivateKey.trim());
+  if (!params.reduceOnly && params.targetLeverage && params.targetLeverage >= 1) {
+    await syncClientHyperliquidLeverage({
+      network: params.network,
+      apiPrivateKey: params.apiPrivateKey,
+      assetIndex: params.assetIndex,
+      leverage: params.targetLeverage,
+      maxLeverage: params.maxLeverage,
+      isCross: true,
+    });
+  }
   // Clamp IOC slippage strictly to 100-150 bps (1.0% - 1.5%)
   const clampedSlipBps = Math.max(100, Math.min(150, Math.round(params.slippageBps || 120)));
   const useAlo = Boolean(params.useAlo) && !params.reduceOnly;

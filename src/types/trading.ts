@@ -105,6 +105,7 @@ export interface BotConfigData {
   sizingMode: 'equity_pct' | 'fixed_usd';
   capitalPctPerTrade: number;
   maxOpenPositions: number;
+  leverage?: number;
   trailingStopEnabled: boolean;
   autoManagePositions: boolean;
   riskPerTradePct: number;
@@ -385,6 +386,8 @@ export interface EngineStateSnapshot {
   selectedInterval: '1m' | '5m' | '15m' | '1h' | '4h';
   markets: HlAssetMarket[];
   selectedL2Book: { bids: HlL2Level[]; asks: HlL2Level[] };
+  l2LastError?: string | null;
+  l2UpdatedAtMs?: number;
   selectedCandles: HlCandle[];
   accountSummary: HlAccountSummary | null;
   fills: HlUserFill[];

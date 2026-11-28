@@ -179,7 +179,7 @@ const STANDARD_COMPATIBLE_PRESETS: AiPreset[] = [
   },
   {
     id: 'ollama',
-    label: 'Ollama Local / Droplet',
+    label: 'Ollama Local / mcloud',
     provider: 'custom_ai',
     url: 'http://127.0.0.1:11434/v1',
     model: 'qwen2.5:14b',
@@ -214,6 +214,7 @@ export const AiBrainParamsModal: React.FC<AiBrainParamsModalProps> = ({
   const [sizingMode, setSizingMode] = useState<'equity_pct' | 'fixed_usd'>(config.sizingMode || 'equity_pct');
   const [capitalPctPerTrade, setCapitalPctPerTrade] = useState(String(config.capitalPctPerTrade || 15));
   const [maxOpenPositions, setMaxOpenPositions] = useState(String(config.maxOpenPositions || 2));
+  const [leverage, setLeverage] = useState(String(config.leverage ?? 10));
   const [riskPerTradePct, setRiskPerTradePct] = useState(String(config.riskPerTradePct ?? 0.35));
   const [dailyMaxLossPct, setDailyMaxLossPct] = useState(String(config.dailyMaxLossPct ?? 2.5));
   const [killSwitchEnabled, setKillSwitchEnabled] = useState(Boolean(config.killSwitchEnabled));
@@ -318,6 +319,7 @@ export const AiBrainParamsModal: React.FC<AiBrainParamsModalProps> = ({
     setSizingMode(config.sizingMode || 'equity_pct');
     setCapitalPctPerTrade(String(config.capitalPctPerTrade || 15));
     setMaxOpenPositions(String(config.maxOpenPositions || 2));
+    setLeverage(String(config.leverage ?? 10));
     setRiskPerTradePct(String(config.riskPerTradePct ?? 0.35));
     setDailyMaxLossPct(String(config.dailyMaxLossPct ?? 2.5));
     setKillSwitchEnabled(Boolean(config.killSwitchEnabled));
@@ -489,7 +491,7 @@ export const AiBrainParamsModal: React.FC<AiBrainParamsModalProps> = ({
     soundEngine.click();
     if (!hasConfiguredBackendForApk() && !backendUrl.trim()) {
       setBenchmarkError(
-        'Conecta la URL de tu servidor Express/Droplet arriba para ejecutar pruebas reales contra @google/genai.'
+        'Conecta la URL de tu servidor mcloud / Cloud Run arriba para ejecutar pruebas reales contra @google/genai.'
       );
       return;
     }
@@ -591,6 +593,7 @@ export const AiBrainParamsModal: React.FC<AiBrainParamsModalProps> = ({
     setSizingMode('equity_pct');
     setCapitalPctPerTrade('15');
     setMaxOpenPositions('2');
+    setLeverage('10');
     setRiskPerTradePct('0.35');
     setDailyMaxLossPct('2.5');
     setGlobalBiasLock('AMBOS');
@@ -632,6 +635,7 @@ export const AiBrainParamsModal: React.FC<AiBrainParamsModalProps> = ({
       sizingMode,
       capitalPctPerTrade: Math.max(1, Math.min(100, Number(capitalPctPerTrade || 15))),
       maxOpenPositions: Math.max(1, Math.min(20, Math.round(Number(maxOpenPositions || 2)))),
+      leverage: Math.max(1, Math.min(50, Math.round(Number(leverage || 10)))),
       riskPerTradePct: Math.max(0.05, Math.min(25.0, Number(riskPerTradePct || 0.35))),
       dailyMaxLossPct: Math.max(0.1, Math.min(100.0, Number(dailyMaxLossPct || 2.5))),
       killSwitchEnabled,
@@ -1338,6 +1342,18 @@ export const AiBrainParamsModal: React.FC<AiBrainParamsModalProps> = ({
                   value={maxOpenPositions}
                   onChange={(e) => setMaxOpenPositions(e.target.value)}
                   className="w-full bg-[#0F131A] border border-slate-700 rounded-md px-2.5 py-1.5 text-xs font-mono-tabular text-slate-100"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">Apalancamiento (x)</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  step={1}
+                  value={leverage}
+                  onChange={(e) => setLeverage(e.target.value)}
+                  className="w-full bg-[#0F131A] border border-slate-700 rounded-md px-2.5 py-1.5 text-xs font-mono-tabular text-amber-300 font-bold"
                 />
               </div>
               <div>

@@ -1125,7 +1125,8 @@ export function computeDynamicOrderNotionalUsd(params: {
 
   // Risk-derived notional = (Equity * Risk%) / SL_distance; leverage derived cleanly from risk & stop distance
   const riskDerivedNotional = (equity * riskPct) / slFrac;
-  const effectiveLev = Math.max(1, Math.min(asset.maxLeverage || 5, 5));
+  const targetLev = Math.max(1, Math.min(100, Number(config.leverage ?? 10)));
+  const effectiveLev = Math.max(1, Math.min(asset.maxLeverage || targetLev, targetLev));
   const equityPctNotional = equity * pct * effectiveLev;
 
   // Cap desired notional by risk budget headroom (1.35x) so wide stops automatically shrink size & leverage!
@@ -2049,7 +2050,9 @@ export function evaluateProfessionalEntryGate(params: {
 
   // Margin sanity guard
   if (accountSummary && accountSummary.accountValue > 0) {
-    const estMarginNeeded = orderUsd / Math.max(1, Math.min(assetMaxLeverage || 5, 5));
+    const targetLev = Math.max(1, Math.min(100, Number(config.leverage ?? 10)));
+    const effectiveLev = Math.max(1, Math.min(assetMaxLeverage || targetLev, targetLev));
+    const estMarginNeeded = orderUsd / effectiveLev;
     if (accountSummary.withdrawable < Math.max(3, estMarginNeeded * 0.85)) {
       return {
         allowed: false,
@@ -2184,7 +2187,8 @@ export function optimizeEntryDecision(params: {
   const remainingSlots = Math.max(1, (config.maxOpenPositions || 2) - openPositions.length);
   const riskPctLabel = (config.riskPerTradePct ?? 0.35).toFixed(2);
   if (accountSummary && accountSummary.withdrawable > 0) {
-    const effectiveLev = Math.max(1, Math.min(asset.maxLeverage || 5, 5));
+    const targetLev = Math.max(1, Math.min(100, Number(config.leverage ?? 10)));
+    const effectiveLev = Math.max(1, Math.min(asset.maxLeverage || targetLev, targetLev));
     const maxPerSlotNotional =
       (accountSummary.withdrawable * 0.88 * effectiveLev) / Math.min(remainingSlots, 2);
     const optimized = Math.max(

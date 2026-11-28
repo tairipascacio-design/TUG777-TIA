@@ -53,7 +53,7 @@ service cloud.firestore {
           'customAiModel', 'customSystemPrompt', 'scanIntervalSec',
           'minConfidence', 'minQuantScore', 'minVolumeM', 'tpPct', 'slPct',
           'useDeepThinking', 'useSearchGrounding', 'sizingMode',
-          'capitalPctPerTrade', 'maxOpenPositions', 'trailingStopEnabled',
+          'capitalPctPerTrade', 'maxOpenPositions', 'leverage', 'trailingStopEnabled',
           'autoManagePositions', 'riskPerTradePct', 'dailyMaxLossPct',
           'killSwitchEnabled', 'geminiModel', 'globalBiasLock',
           'pairBiasLocksJson', 'useAloEntries', 'minOrderUsdFloor',
@@ -85,6 +85,7 @@ service cloud.firestore {
         && (!('sizingMode' in data) || data.sizingMode in ['equity_pct', 'fixed_usd'])
         && (!('capitalPctPerTrade' in data) || (data.capitalPctPerTrade is number && data.capitalPctPerTrade >= 1 && data.capitalPctPerTrade <= 100))
         && (!('maxOpenPositions' in data) || (data.maxOpenPositions is number && data.maxOpenPositions >= 1 && data.maxOpenPositions <= 20))
+        && (!('leverage' in data) || (data.leverage is number && data.leverage >= 1 && data.leverage <= 100))
         && (!('trailingStopEnabled' in data) || data.trailingStopEnabled is bool)
         && (!('autoManagePositions' in data) || data.autoManagePositions is bool)
         && (!('riskPerTradePct' in data) || (data.riskPerTradePct is number && data.riskPerTradePct >= 0.05 && data.riskPerTradePct <= 25))
@@ -201,7 +202,7 @@ service cloud.firestore {
             'customAiModel', 'customSystemPrompt', 'scanIntervalSec',
             'minConfidence', 'minQuantScore', 'minVolumeM', 'tpPct', 'slPct',
             'useDeepThinking', 'useSearchGrounding', 'sizingMode',
-            'capitalPctPerTrade', 'maxOpenPositions', 'trailingStopEnabled',
+            'capitalPctPerTrade', 'maxOpenPositions', 'leverage', 'trailingStopEnabled',
             'autoManagePositions', 'riskPerTradePct', 'dailyMaxLossPct',
             'killSwitchEnabled', 'geminiModel', 'globalBiasLock',
             'pairBiasLocksJson', 'useAloEntries', 'minOrderUsdFloor',

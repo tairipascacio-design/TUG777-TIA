@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ShieldCheck, XCircle, Zap } from 'lucide-react';
+import { AlertTriangle, RefreshCw, ShieldCheck, XCircle, Zap } from 'lucide-react';
 import type { HlAssetMarket, HlL2Level } from '../types/trading';
 import { formatSignedUsd } from '../utils/formatters';
 import { soundEngine } from '../utils/soundEngine';
@@ -12,6 +12,12 @@ interface OrderBookPanelProps {
   mevShieldEnabled: boolean;
   activeRoute?: string;
   defaultNotionalUsd: number;
+  leverage?: number;
+  l2Error?: string | null;
+  l2Loading?: boolean;
+  l2Source?: string;
+  l2UpdatedAtMs?: number;
+  onRetryL2?: () => void;
   executing: boolean;
   useAloEntries?: boolean;
   onToggleAlo?: (useAlo: boolean) => void;
@@ -35,6 +41,11 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
   mevShieldEnabled,
   activeRoute = 'TUG777-ENGINE',
   defaultNotionalUsd,
+  leverage = 10,
+  l2Error = null,
+  l2Loading = false,
+  l2Source,
+  onRetryL2,
   executing,
   useAloEntries = false,
   onToggleAlo,
@@ -56,19 +67,86 @@ export const OrderBookPanel: React.FC<OrderBookPanelProps> = ({
 
   const formatPx = (p: number) => (p >= 1000 ? p.toFixed(2) : p >= 1 ? p.toFixed(4) : p.toPrecision(5));
 
+  const effectiveLeverage = Math.max(1, Math.min(asset?.maxLeverage ?? 20, Math.round(leverage || 10)));
+
   return (
     <div className="bg-[#0F131A] border border-slate-800/90 rounded-lg flex flex-col">
       <div className="px-4 py-3 border-b border-slate-800/80 flex items-center justify-between gap-2">
         <div className="min-w-0">
           <h3 className="text-sm font-semibold text-slate-100 truncate">Libro L2 y Ejecución</h3>
           <p className="text-xs text-slate-400 truncate">
-            Apalancamiento nativo · Max {asset?.maxLeverage ?? 20}x
+            Apalancamiento <span className="text-amber-300 font-semibold">{effectiveLeverage}x</span> (Cross) · Max {asset?.maxLeverage ?? 20}x
           </p>
         </div>
-        <span className="font-mono-tabular text-xs text-slate-400 whitespace-nowrap shrink-0">
-          Spread {spreadBps.toFixed(1)} bps
-        </span>
+        <div className="flex items-center gap-2 shrink-0">
+          <span
+            className={`font-mono-tabular text-xs whitespace-nowrap ${
+              l2Error ? 'text-red-400' : 'text-slate-400'
+            }`}
+          >
+            {bestBid > 0 && bestAsk > 0 ? `Spread ${spreadBps.toFixed(1)} bps` : 'Spread --'}
+          </span>
+          {onRetryL2 && (
+            <button
+              type="button"
+              title="Actualizar Libro L2"
+              disabled={l2Loading}
+              onClick={() => {
+                soundEngine.click();
+                onRetryL2();
+              }}
+              className="p-1 rounded bg-slate-800/90 hover:bg-slate-700 text-slate-300 disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${l2Loading ? 'animate-spin' : ''}`} />
+            </button>
+          )}
+        </div>
       </div>
+
+      {l2Error && (
+        <div className="mx-3 mt-2.5 p-2.5 rounded-md bg-red-500/10 border border-red-500/40 text-[11px] text-red-200 flex items-start justify-between gap-2">
+          <div className="flex items-start gap-1.5 min-w-0">
+            <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" />
+            <span className="break-words">
+              <strong className="text-red-300">Error Motor L2:</strong> {l2Error}
+            </span>
+          </div>
+          {onRetryL2 && (
+            <button
+              type="button"
+              onClick={() => {
+                soundEngine.click();
+                onRetryL2();
+              }}
+              className="px-2 py-1 rounded bg-red-600/30 hover:bg-red-600/50 text-red-100 font-semibold whitespace-nowrap shrink-0"
+            >
+              Reintentar
+            </button>
+          )}
+        </div>
+      )}
+
+      {!l2Error && bids.length === 0 && asks.length === 0 && (
+        <div className="mx-3 mt-2.5 p-2.5 rounded-md bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-200 flex items-center justify-between gap-2">
+          <span>
+            {l2Loading
+              ? `Cargando libro L2 de ${asset?.coin || 'mercado'}...`
+              : `Libro L2 sin niveles para ${asset?.coin || 'mercado'}${l2Source ? ` (${l2Source})` : ''}.`}
+          </span>
+          {onRetryL2 && !l2Loading && (
+            <button
+              type="button"
+              onClick={() => {
+                soundEngine.click();
+                onRetryL2();
+              }}
+              className="px-2 py-1 rounded bg-amber-500/20 hover:bg-amber-500/35 text-amber-200 font-semibold whitespace-nowrap shrink-0"
+            >
+              Reintentar L2
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Asks (top 6 reversed) */}
       <div className="px-3 pt-2 pb-1 space-y-0.5 font-mono-tabular text-xs">

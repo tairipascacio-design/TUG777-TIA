@@ -74,7 +74,11 @@ async function raceHyperliquidPost(network: 'mainnet' | 'testnet', endpointPath:
         channel: 'HL-NODE-1',
       };
     } catch (err) {
-      lastErr = err instanceof Error ? err : new Error(String(err));
+      if (err instanceof Error && err.name === 'AbortError') {
+        lastErr = new Error(`Timeout 5000ms conectando a Hyperliquid (${baseUrl}${endpointPath})`);
+      } else {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+      }
       if (attempt === 0) {
         await new Promise((r) => setTimeout(r, 250));
       }
@@ -200,7 +204,17 @@ app.get('/api/mcloud/context', async (req, res) => {
 app.post('/api/mcloud/test', async (req, res) => {
   const rawUrl = typeof req.body?.mcloudUrl === 'string' ? req.body.mcloudUrl : undefined;
   const result = await probeMcloudHealth(rawUrl);
+  engineRuntime.updateMcloudProbeStatus(result);
   res.json(result);
+});
+
+app.post('/api/mcloud/sync-state', async (req, res) => {
+  const rawUrl = typeof req.body?.mcloudUrl === 'string' ? req.body.mcloudUrl : undefined;
+  const result = await engineRuntime.syncSnapshotToMcloud(rawUrl);
+  res.status(result.ok ? 200 : 502).json({
+    ...result,
+    snapshot: engineRuntime.getSnapshot(),
+  });
 });
 
 app.post('/api/engine/probe-url', async (req, res) => {
